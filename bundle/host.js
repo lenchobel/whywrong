@@ -151,4 +151,36 @@ export async function saveNotebook(list) {
   } catch (err) {
     throw new HostError('storage_write', 'Your notebook could not be saved.', err);
   }
+  // A "Saved to notebook" button is a lie if the next reload is empty. Read
+  // back and compare ids + mastered flags before reporting success.
+  let res;
+  try {
+    res = await host.storage.get({ key: NOTEBOOK_KEY });
+  } catch (err) {
+    throw new HostError('save_not_stuck', 'It looked like it saved, but reading it back failed.', err);
+  }
+  if (!res || res.exists === false) {
+    console.warn('[WhyWrong] save did not stick: storage reported OK but read-back was empty');
+    throw new HostError('save_not_stuck', 'It looked like it saved, but it did not stick, so it may be gone when you close the app. Try again.');
+  }
+  const readback = parseNotebook(res.value);
+  if (!sameNotebookShape(list, readback)) {
+    console.warn('[WhyWrong] save did not stick: wrote', list.map(slimItem).join(','), 'read back', readback.map(slimItem).join(','));
+    throw new HostError('save_not_stuck', 'It looked like it saved, but it did not stick, so it may be gone when you close the app. Try again.');
+  }
 }
+
+// True when every written item is present in the read-back with the same
+// id and mastered flag (and no extra items snuck in). Order is NOT compared
+// because some backends reorder on round-trip.
+function sameNotebookShape(written, readback) {
+  if (written.length !== readback.length) return false;
+  for (const w of written) {
+    const r = readback.find((x) => x.id === w.id);
+    if (!r) return false;
+    if (Boolean(r.mastered) !== Boolean(w.mastered)) return false;
+  }
+  return true;
+}
+
+const slimItem = (it) => `${it.id}${it.mastered ? '*' : ''}`;

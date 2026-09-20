@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   LIMITS, TRAPS, TRAP_IDS, trapById, checkInput, buildRequest, parseModelJson, validateDiagnosis,
   splitHighlights, makeItem, parseNotebook, addItem, removeItem, toggleMastered, filterItems,
-  weekStats, exportText, diagnoseWith,
+  weekStats, exportText, diagnoseWith, allTimeStats,
 } from '../bundle/core.js';
 
 const good = (over = {}) => ({
@@ -394,6 +394,39 @@ test('weekStats breaks ties by the fixed trap order, so results do not jump arou
   const now = Date.now();
   const list = [item('a', { trapId: 'leap', createdAt: now }), item('b', { trapId: 'too_extreme', createdAt: now })];
   assert.equal(weekStats(list, now).top.id, 'too_extreme');
+});
+
+// ---- all-time stats (Bug 2: Patterns falls back when last-7-days is empty) ---
+
+test('allTimeStats returns an empty shape for an empty notebook', () => {
+  const s = allTimeStats([]);
+  assert.equal(s.total, 0);
+  assert.equal(s.top, null);
+  assert.deepEqual(s.byTrap, []);
+});
+
+test('allTimeStats ranks every saved mistake, not just the last 7 days', () => {
+  const now = Date.UTC(2026, 8, 20, 12);
+  const day = 86400000;
+  const list = [
+    item('a', { trapId: 'half_right', createdAt: now - day }),
+    item('b', { trapId: 'half_right', createdAt: now - 2 * day }),
+    item('c', { trapId: 'leap', createdAt: now - 3 * day }),
+    item('d', { trapId: 'leap', createdAt: now - 20 * day }), // older than 7 days
+    item('e', { trapId: 'opposite', createdAt: now - 6.5 * day, mastered: true }),
+  ];
+  const s = allTimeStats(list);
+  assert.equal(s.total, 5);
+  assert.equal(s.top.id, 'half_right');
+  assert.equal(s.top.count, 2);
+});
+
+test('allTimeStats counts a single mistake as the top trap', () => {
+  const now = Date.now();
+  const s = allTimeStats([item('a', { trapId: 'not_in_text', createdAt: now })]);
+  assert.equal(s.total, 1);
+  assert.equal(s.top.id, 'not_in_text');
+  assert.equal(s.top.count, 1);
 });
 
 // ---- export --------------------------------------------------------------------

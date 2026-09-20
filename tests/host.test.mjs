@@ -147,10 +147,23 @@ test('saveNotebook stores an array directly (SDK serialises) and a later load ge
 
 test('saveNotebook sends { key, value } with the array as value', async () => {
   let seen;
-  fakeAnna({ storage: {
-    get: async ({ key }) => ({ value: null, exists: false }),
-    set: async (args) => { seen = args; return { ok: true }; },
-  } });
+  // Use the default fakeAnna store so the read-back check passes; only spy
+  // on set() so we can capture the args without changing behaviour.
+  const store = fakeAnna();
+  globalThis.AnnaAppRuntime = {
+    async connect() {
+      return {
+        llm: { complete: async () => ({ content: { type: 'text', text: '' } }) },
+        storage: {
+          get: async ({ key }) => {
+            if (!store.has(key)) return { value: null, exists: false };
+            return { value: store.get(key), exists: true };
+          },
+          set: async (args) => { seen = args; store.set(args.key, args.value); return { ok: true }; },
+        },
+      };
+    },
+  };
   await saveNotebook(notebook);
   assert.equal(seen.key, 'notebook');
   assert.ok(Array.isArray(seen.value));
@@ -160,4 +173,44 @@ test('saveNotebook sends { key, value } with the array as value', async () => {
 test('saveNotebook turns a storage failure into a HostError', async () => {
   fakeAnna({ storage: { get: async () => ({ value: null, exists: false }), set: async () => { throw new Error('quota exceeded'); } } });
   await assert.rejects(saveNotebook(notebook), (e) => e instanceof HostError && e.code === 'storage_write');
+});
+
+// Bug 2: a save that returns OK but does not actually persist is the worst
+// possible outcome — the screen shows "Saved to notebook" but the next reload
+// is empty. saveNotebook must read back the stored value and compare.
+
+test('saveNotebook throws save_not_stuck when set() reports OK but the read-back is missing', async () => {
+  // set() returns OK but does NOT write to the store — same shape a flaky
+  // APS backend or a write that is silently dropped would produce.
+  fakeAnna({ storage: {
+    get: async () => ({ value: null, exists: false }),
+    set: async () => ({ ok: true }),
+  } });
+  // Stub console.warn so we can assert it's called with the [WhyWrong] tag.
+  const origWarn = console.warn;
+  const warns = [];
+  console.warn = (...args) => warns.push(args);
+  try {
+    await assert.rejects(saveNotebook(notebook), (e) => e instanceof HostError && e.code === 'save_not_stuck');
+    assert.ok(warns.some((a) => String(a[0]).startsWith('[WhyWrong]')), 'console.warn called with [WhyWrong] tag');
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test('saveNotebook throws save_not_stuck when set() returns OK but the read-back list differs', async () => {
+  // set() returns OK; get() returns a list with different ids/mastered flags.
+  fakeAnna({ storage: {
+    get: async () => ({ value: [{ id: 'something-else', trapId: 'leap', question: '', picked: '', drills: [], mastered: false }], exists: true }),
+    set: async () => ({ ok: true }),
+  } });
+  await assert.rejects(saveNotebook(notebook), (e) => e instanceof HostError && e.code === 'save_not_stuck');
+});
+
+test('saveNotebook succeeds when the read-back matches what was written (same ids and mastered flags)', async () => {
+  fakeAnna({ storage: {
+    get: async () => ({ value: notebook, exists: true }),
+    set: async () => ({ ok: true }),
+  } });
+  await saveNotebook(notebook); // should not throw
 });

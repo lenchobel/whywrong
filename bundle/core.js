@@ -402,6 +402,22 @@ export function weekStats(list, now = Date.now(), days = 7) {
   };
 }
 
+// Same shape as weekStats minus `stillTricky` / `allTime`, but counts every
+// item in the list regardless of age. The Patterns page uses this when the
+// last-7-days window is empty so the screen never shows a blank top trap.
+export function allTimeStats(list) {
+  const counts = new Map();
+  for (const x of list) counts.set(x.trapId, (counts.get(x.trapId) || 0) + 1);
+  const byTrap = [...counts.entries()]
+    .map(([id, count]) => ({ id, count }))
+    .sort((a, b) => b.count - a.count || TRAP_IDS.indexOf(a.id) - TRAP_IDS.indexOf(b.id));
+  return {
+    total: list.length,
+    byTrap,
+    top: byTrap[0] || null,
+  };
+}
+
 export function exportText(list) {
   if (!list.length) return '';
   return list

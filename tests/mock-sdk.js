@@ -56,7 +56,9 @@ const anna = {
       const w = W();
       w.setCalls += 1;
       if (w.setFails) throw new Error('quota exceeded');
-      w.store.set(key, value);
+      // silentSet: set() reports OK but does NOT actually write — used to
+      // verify that the bundle's read-back check catches a flaky backend.
+      if (!w.silentSet) w.store.set(key, value);
       return { ok: true };
     },
   },

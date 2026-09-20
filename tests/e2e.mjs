@@ -70,7 +70,7 @@ const seedItem = (i, trapId, over = {}) => ({
   ...over,
 });
 
-async function open({ width = 1000, height = 900, seed = null, getFails = false, setFails = false, reducedMotion = 'no-preference', llm = [] } = {}) {
+async function open({ width = 1000, height = 900, seed = null, getFails = false, setFails = false, silentSet = false, reducedMotion = 'no-preference', llm = [] } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, reducedMotion });
   const page = await ctx.newPage();
   const problems = [];
@@ -78,10 +78,10 @@ async function open({ width = 1000, height = 900, seed = null, getFails = false,
   page.on('console', (m) => {
     if (m.type() === 'error' || /Content Security Policy|Refused/.test(m.text())) problems.push(`console: ${m.text()}`);
   });
-  await page.addInitScript(({ seed, getFails, setFails, llm }) => {
-    globalThis.__WW = { llm, calls: [], store: new Map(), setCalls: 0, getFails, setFails };
+  await page.addInitScript(({ seed, getFails, setFails, silentSet, llm }) => {
+    globalThis.__WW = { llm, calls: [], store: new Map(), setCalls: 0, getFails, setFails, silentSet };
     if (seed) globalThis.__WW.store.set('notebook', JSON.stringify(seed));
-  }, { seed, getFails, setFails, llm });
+  }, { seed, getFails, setFails, silentSet, llm });
   await page.goto(BASE);
   await page.waitForSelector('#examples .link');
   return { page, ctx, problems };
@@ -242,6 +242,83 @@ await scenario('correct verdict: info notice + add-the-right-answer button, no t
   // The button focuses the right-answer box.
   await page.getByRole('button', { name: 'Add the right answer' }).click();
   assert.equal(await page.evaluate(() => document.activeElement.id), 'f-right');
+  clean(problems);
+  await ctx.close();
+});
+
+// Bug 2 — save readback
+await scenario('a set() that reports OK but does not store shows "did not stick" and never marks it saved', async () => {
+  const { page, ctx, problems } = await open({ silentSet: true });
+  await runSample(page, 0);
+  await waitResult(page);
+  await page.getByRole('button', { name: 'Save to notebook' }).click();
+  // The button must NOT flip to "Saved to notebook" because the read-back
+  // check failed.
+  await page.waitForSelector('.save-note', { timeout: 5000 });
+  const note = (await page.textContent('.save-note')) || '';
+  assert.match(note, /did not stick/i, 'shows the "did not stick" warning');
+  assert.equal(await page.locator('.save-row .btn.primary:has-text("Saved")').count(), 0, 'not marked as saved');
+  assert.equal(await page.locator('.save-row .btn.primary:has-text("Save to notebook")').count(), 1, 'save button still available');
+  // Notebook stays empty.
+  assert.equal((await storeNotebook(page)).length, 0);
+  // Tab count stays at 0.
+  assert.equal((await page.textContent('#nb-count')).trim(), '');
+  clean(problems);
+  await ctx.close();
+});
+
+// Bug 2 — Patterns page rendering for the various notebook states.
+await scenario('patterns: empty notebook shows the friendly empty message', async () => {
+  const { page, ctx, problems } = await open();
+  await page.click('.tab[data-view=patterns]');
+  await page.waitForSelector('#view-patterns .empty', { timeout: 5000 });
+  const text = await page.textContent('#view-patterns');
+  assert.match(text, /Save a mistake and this page shows/);
+  assert.equal(await page.locator('#view-patterns .bars').count(), 0, 'no bar chart on empty');
+  assert.equal(await page.locator('#view-patterns .big-line').count(), 0, 'no headline on empty');
+  clean(problems);
+  await ctx.close();
+});
+
+await scenario('patterns: one saved mistake shows the top trap and a "save a few more" hint', async () => {
+  const seedOne = [{
+    id: 's1', createdAt: Date.now(), question: 'A passage about traffic fees. Which statement is best supported?',
+    picked: 'The fee eliminated traffic.', right: 'The fee reduced traffic.',
+    trapId: 'too_extreme', whyTempting: 'Eliminated sounds stronger than the passage supports.',
+    trapWords: ['eliminated'], rule: 'Strong words need strong proof.',
+    check: 'Can I point to the line that proves every strong word?',
+    whyRight: 'Traffic fell, but the passage never says it stopped.',
+    drills: [], mastered: false,
+  }];
+  const { page, ctx, problems } = await open({ seed: seedOne });
+  await page.click('.tab[data-view=patterns]');
+  await page.waitForSelector('#view-patterns .bars', { timeout: 5000 });
+  const text = await page.textContent('#view-patterns');
+  assert.match(text, /1 mistake/);
+  assert.match(text, /Too extreme/);
+  assert.match(text, /save a few more/i);
+  assert.match(text, /real pattern/i);
+  clean(problems);
+  await ctx.close();
+});
+
+await scenario('patterns: only old mistakes fall back to the whole notebook, not last 7 days', async () => {
+  const veryOld = [{
+    id: 'o1', createdAt: Date.now() - 60 * 86400000, // 60 days ago
+    question: 'An old passage about traffic fees. Which statement is best supported?',
+    picked: 'The fee eliminated traffic.', right: 'The fee reduced traffic.',
+    trapId: 'too_extreme', whyTempting: 'Eliminated sounds stronger than the passage supports.',
+    trapWords: ['eliminated'], rule: 'Strong words need strong proof.',
+    check: 'Can I point to the line that proves every strong word?',
+    whyRight: 'Traffic fell, but the passage never says it stopped.',
+    drills: [], mastered: false,
+  }];
+  const { page, ctx, problems } = await open({ seed: veryOld });
+  await page.click('.tab[data-view=patterns]');
+  await page.waitForSelector('#view-patterns .bars', { timeout: 5000 });
+  const text = await page.textContent('#view-patterns');
+  assert.match(text, /in your notebook/i, 'falls back to whole-notebook language');
+  assert.match(text, /Too extreme/);
   clean(problems);
   await ctx.close();
 });
