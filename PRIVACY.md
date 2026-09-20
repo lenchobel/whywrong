@@ -26,4 +26,4 @@ Personal details such as your full name, address, phone number, or passwords. Wh
 The explanations and practice questions are written by AI. Check them against your textbook or ask your teacher if something looks off.
 
 ## Contact
-Questions or a request about your data: Open an issue at <repo issues URL>
+Questions or a request about your data: Open an issue at https://github.com/lenchobel/whywrong/issues
