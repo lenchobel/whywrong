@@ -249,6 +249,20 @@ async function runDiagnosis(input) {
         ],
         actions: [{ label: 'Add the right answer', onClick: () => fields.right.input().focus() }],
       });
+    } else if (outcome.kind === 'correct_conflict') {
+      // Picked answer is right AND the student's right answer disagrees with
+      // it. We asked the AI twice; it still says correct. Surface the conflict
+      // so the student can ask their teacher.
+      $('#result').replaceChildren();
+      state.current = null;
+      showNotice({
+        info: true,
+        lines: [
+          outcome.reason,
+          "The AI thinks your answer says the same as the right answer you gave. If your answer key disagrees, check it with your teacher.",
+        ],
+        actions: [{ label: 'Add the right answer', onClick: () => fields.right.input().focus() }],
+      });
     } else if (outcome.kind === 'refused') {
       showNotice({
         info: true,

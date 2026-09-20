@@ -262,12 +262,12 @@ test('validateDiagnosis rejects verdict: "correct" with no why string', () => {
   assert.ok(r.reason && r.reason.length > 0, 'correct outcome has a fallback reason');
 });
 
-test('diagnoseWith returns { kind: "correct" } without retrying', async () => {
+test('diagnoseWith returns { kind: "correct" } without retrying when there is no right-vs-picked conflict', async () => {
   let calls = 0;
   const out = await diagnoseWith(async () => {
     calls += 1;
     return '{"ok": true, "verdict": "correct", "why": "Your answer matches the passage."}';
-  }, input);
+  }, { ...input, right: '' });
   assert.equal(calls, 1, 'no retry on a correct verdict');
   assert.equal(out.kind, 'correct');
   assert.equal(out.reason, 'Your answer matches the passage.');
@@ -282,6 +282,62 @@ test('diagnoseWith returns correct verdict even when the right answer is empty',
   }, { ...input, right: '' });
   assert.equal(calls, 1);
   assert.equal(out.kind, 'correct');
+});
+
+// ---- Verdict trust (Bug C) --------------------------------------------------
+// When the student gives a right answer that differs from the picked answer,
+// and the AI says the pick is correct anyway, we don't trust the AI on the
+// first reply — we retry once with a note about the conflict. If it still
+// says correct, the screen surfaces the conflict so the student can ask their
+// teacher.
+
+test('diagnoseWith retries once when student-supplied right answer disagrees with a correct verdict', async () => {
+  const seen = [];
+  const replies = [
+    '{"ok": true, "verdict": "correct", "why": "Pick matches the passage."}',
+    '{"ok": true, "verdict": "correct", "why": "Still think so."}',
+  ];
+  const out = await diagnoseWith(async (req) => { seen.push(req.messages[0].content); return replies.shift(); }, input);
+  assert.equal(out.kind, 'correct_conflict');
+  assert.equal(seen.length, 2);
+  assert.ok(!seen[0].includes('your last reply said'), 'first reply is not annotated as a retry');
+  assert.match(seen[1], /your last reply said/i, 'retry note references the conflict');
+});
+
+test('diagnoseWith returns { kind: "ok" } if the conflict retry produces a real diagnosis', async () => {
+  const replies = [
+    '{"ok": true, "verdict": "correct", "why": "Pick matches."}',
+    JSON.stringify(good()),
+  ];
+  const out = await diagnoseWith(async () => replies.shift(), input);
+  assert.equal(out.kind, 'ok');
+  assert.equal(out.value.trapId, 'too_extreme');
+});
+
+test('diagnoseWith does NOT retry on a correct verdict when no right answer was given', async () => {
+  let calls = 0;
+  const out = await diagnoseWith(async () => {
+    calls += 1;
+    return '{"ok": true, "verdict": "correct", "why": "Matches the passage."}';
+  }, { ...input, right: '' });
+  assert.equal(calls, 1, 'no conflict to resolve');
+  assert.equal(out.kind, 'correct');
+});
+
+test('diagnoseWith does NOT retry on a correct verdict when right answer equals the picked answer', async () => {
+  let calls = 0;
+  const out = await diagnoseWith(async () => {
+    calls += 1;
+    return '{"ok": true, "verdict": "correct", "why": "Matches."}';
+  }, { ...input, right: input.picked });
+  assert.equal(calls, 1, 'no conflict to resolve');
+  assert.equal(out.kind, 'correct');
+});
+
+test('buildRequest uses a "Note on your last reply" prefix for conflict retries', () => {
+  const r = buildRequest(input, 'The picked and right answers disagree.', { reason: 'conflict' });
+  assert.match(r.messages[0].content, /Note on your last reply/);
+  assert.doesNotMatch(r.messages[0].content, /could not be used/);
 });
 
 // ---- highlighting --------------------------------------------------------------

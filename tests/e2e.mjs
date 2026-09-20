@@ -264,6 +264,28 @@ await scenario('one bad reply is retried automatically and the student never see
   await ctx.close();
 });
 
+// Bug C — verdict trust: when the AI insists the picked answer is correct
+// but the student gave a different right answer, we retry once and surface
+// the conflict so the student can ask their teacher.
+await scenario('correct-conflict: AI says correct twice with a right-vs-picked conflict, screen surfaces the conflict notice', async () => {
+  const correctText = JSON.stringify({
+    ok: true, verdict: 'correct', why: 'Pick matches the passage.',
+  });
+  // The sample question already has a right answer that differs from picked.
+  const { page, ctx, problems } = await open({ llm: [{ text: correctText }, { text: correctText }] });
+  await runSample(page, 0);
+  await page.waitForSelector('#status .notice.info', { timeout: 5000 });
+  const notice = await page.textContent('#status');
+  assert.match(notice, /AI thinks your answer says the same as the right answer/i);
+  assert.match(notice, /check it with your teacher/i);
+  assert.equal(await callCount(page), 2, 'retried once before showing the conflict');
+  // Nothing saved; no save row.
+  assert.equal(await page.locator('.save-row .btn.primary').count(), 0);
+  assert.equal((await storeNotebook(page)).length, 0);
+  clean(problems);
+  await ctx.close();
+});
+
 // Bug 1: when the AI says the picked answer is correct, the screen shows an
 // info notice with the reason, an "Add the right answer" button that focuses
 // the right-answer box, no trap and no drills, nothing saved.

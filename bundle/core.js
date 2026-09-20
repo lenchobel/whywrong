@@ -121,7 +121,7 @@ function fail(field, message) {
 // ---------------------------------------------------------------------------
 // The prompt sent to Anna's AI
 
-export function buildRequest({ question, picked, right }, retryNote = '') {
+export function buildRequest({ question, picked, right }, retryNote = '', { reason = 'unusable' } = {}) {
   const traps = TRAPS.map((t) => `- ${t.id}: ${t.blurb}`).join('\n');
 
   const system = [
@@ -187,7 +187,16 @@ export function buildRequest({ question, picked, right }, retryNote = '') {
     right ? `<right_answer>\n${right}\n</right_answer>` : '<right_answer></right_answer>',
   ];
   if (retryNote) {
-    parts.push(`Your last reply could not be used: ${retryNote} Reply again with valid JSON in the exact shape, and nothing else.`);
+    // Two different retry contexts:
+    //   'unusable' — the previous reply was broken JSON or wrong shape; the AI
+    //     must re-emit valid output. Says "could not be used" so it doesn't
+    //     think the diagnosis was right but rejected.
+    //   'conflict' — the previous reply said the picked answer is correct, but
+    //     the student provided a different right answer. The AI must reconcile.
+    const lead = reason === 'conflict'
+      ? 'Note on your last reply:'
+      : 'Your last reply could not be used:';
+    parts.push(`${lead} ${retryNote} Reply again with valid JSON in the exact shape, and nothing else.`);
   }
 
   return { system, messages: [{ role: 'user', content: parts.join('\n\n') }] };
@@ -443,16 +452,30 @@ export function exportText(list) {
 // can be tested without Anna.
 //
 // Returns one of:
-//   { kind: 'ok', value }          a checked diagnosis
-//   { kind: 'refused', reason }    the AI says this is not a question and answer
-//   { kind: 'unusable', detail }   two unusable replies in a row
+//   { kind: 'ok', value }             a checked diagnosis
+//   { kind: 'correct', reason }       the picked answer is right (no conflict)
+//   { kind: 'correct_conflict', reason }  the picked answer is right AND the
+//                                        student gave a different right answer;
+//                                        retried once, AI still says correct.
+//                                        Caller should surface the conflict so
+//                                        the student can ask their teacher.
+//   { kind: 'refused', reason }       the AI says this is not a question and answer
+//   { kind: 'unusable', detail }      two unusable replies in a row
 // A failed platform call (timeout, no answer) is thrown, not returned.
 
+const CONFLICT_RETRY_NOTE = 'Your last reply said the picked answer is correct, but the student gave a different right answer. The two answers disagree about what the passage supports. Re-read both carefully: if the picked answer is genuinely correct, reply with the "verdict: correct" shape again; if the picked answer is wrong, pick a trap and write drills.';
+
 export async function diagnoseWith(complete, input) {
+  // The "conflict" only exists when the student gave a right answer that
+  // differs from the picked answer. Without a right answer there is nothing
+  // to be in conflict with, so a correct verdict stands.
+  const hasConflict = !!input.right && String(input.right).trim() !== '' && input.right !== input.picked;
   let note = '';
   let detail = '';
+  let correctRetried = false;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const text = await complete(buildRequest(input, note));
+    const reqArgs = note ? { reason: correctRetried ? 'conflict' : 'unusable' } : {};
+    const text = await complete(buildRequest(input, note, reqArgs));
     let parsed;
     try {
       parsed = parseModelJson(text);
@@ -462,10 +485,19 @@ export async function diagnoseWith(complete, input) {
     }
     const result = validateDiagnosis(parsed, { picked: input.picked });
     if (result.ok) return { kind: 'ok', value: result.value };
-    // The picked answer is correct — its own terminal outcome. No retry,
-    // no trap, no drills. The student needs an info notice, not a fix.
-    if (result.correct) return { kind: 'correct', reason: result.reason };
     if (result.refused) return { kind: 'refused', reason: result.reason };
+    // The picked answer is correct. If the student's right answer disagrees
+    // with it and we have not yet retried, push back once. If we already
+    // retried, surface the conflict rather than blindly trusting the AI.
+    if (result.correct) {
+      if (hasConflict && !correctRetried) {
+        correctRetried = true;
+        note = CONFLICT_RETRY_NOTE;
+        continue;
+      }
+      if (hasConflict) return { kind: 'correct_conflict', reason: result.reason };
+      return { kind: 'correct', reason: result.reason };
+    }
     note = detail = result.error;
   }
   return { kind: 'unusable', detail };
