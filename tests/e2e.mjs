@@ -289,12 +289,18 @@ await scenario('correct-conflict: AI says correct twice with a right-vs-picked c
 // Bug 1: when the AI says the picked answer is correct, the screen shows an
 // info notice with the reason, an "Add the right answer" button that focuses
 // the right-answer box, no trap and no drills, nothing saved.
+// The right answer is cleared before submitting: both samples ship a right
+// answer that differs from their picked answer, and since Fix C that case
+// retries once (exhausting the one-reply mock queue), so the plain
+// correct-verdict path is only reachable without a right answer.
 await scenario('correct verdict: info notice + add-the-right-answer button, no trap, no save', async () => {
   const correctText = JSON.stringify({
     ok: true, verdict: 'correct', why: 'The picked answer is supported by the passage, just like the right answer.',
   });
   const { page, ctx, problems } = await open({ llm: [{ text: correctText }] });
-  await runSample(page, 0);
+  await page.locator('#examples .link').nth(0).click();
+  await page.fill('#f-right', '');
+  await page.click('#go');
   await page.waitForSelector('#status .notice.info', { timeout: 5000 });
   const notice = await page.textContent('#status');
   assert.match(notice, /Good news: your answer looks right/);
