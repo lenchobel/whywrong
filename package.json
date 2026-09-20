@@ -1,0 +1,12 @@
+{
+  "name": "whywrong",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/core.test.mjs tests/host.test.mjs",
+    "test:e2e": "node tests/e2e.mjs",
+    "dev": "anna-app dev",
+    "validate": "anna-app validate --strict"
+  }
+}

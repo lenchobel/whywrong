@@ -1,0 +1,9 @@
+{
+  "slug": "whywrong",
+  "name": "WhyWrong",
+  "version": "0.1.0",
+  "tagline": "Find out why the wrong answer looked right, then practice that trap with 3 new questions.",
+  "description": "Got a multiple-choice question wrong and not sure why the wrong answer looked so good? WhyWrong takes it apart.\n\nPaste the question, the answer you picked, and the right answer if you have it. WhyWrong names the trap that caught you (too extreme, half right, not in the text, and more), highlights the exact words that fooled you, and explains the rule in plain language. Then it writes three new practice questions for the same trap, with instant feedback on every choice.\n\nSave each mistake to your private notebook, search it, and mark the ones you've got. The Patterns page shows which trap catches you most, plus the one rule that beats it.\n\nMade for students practicing reading and reasoning questions. It works with any practice test: you paste your own questions, and the practice questions it writes are new and original. WhyWrong is not affiliated with any exam board.\n\nThe explanations are written by AI, so check them against your textbook or teacher if something looks off. Your notebook is saved in your Anna account, and the question you paste is sent to Anna's AI to write the feedback.",
+  "category": "education",
+  "pricing_model": "free"
+}

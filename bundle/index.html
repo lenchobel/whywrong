@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>WhyWrong</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div class="page">
+    <header class="masthead">
+      <p class="brand">WhyWrong</p>
+      <nav class="tabs" aria-label="Sections">
+        <button type="button" class="tab" data-view="diagnose" aria-current="page">Diagnose</button>
+        <button type="button" class="tab" data-view="notebook" aria-current="false">Notebook<span class="count" id="nb-count" hidden></span></button>
+        <button type="button" class="tab" data-view="patterns" aria-current="false">Patterns</button>
+      </nav>
+    </header>
+
+    <main class="sheet" id="main">
+      <section id="view-diagnose" aria-labelledby="h-diagnose">
+        <h1 id="h-diagnose" tabindex="-1">Paste a question you got wrong.</h1>
+        <p class="lede">We find the trap, explain the rule, and write three new questions so you can practice.</p>
+
+        <form id="form" novalidate>
+          <div class="field">
+            <label for="f-question">The question</label>
+            <p class="hint" id="f-question-hint">Include the passage and the answer choices if you have them.</p>
+            <textarea id="f-question" name="question" rows="8" aria-describedby="f-question-hint f-question-err f-question-count"></textarea>
+            <p class="counter" id="f-question-count" hidden></p>
+            <p class="field-error" id="f-question-err" role="alert" hidden></p>
+          </div>
+
+          <div class="field">
+            <label for="f-picked">The answer you picked</label>
+            <textarea id="f-picked" name="picked" rows="2" aria-describedby="f-picked-err"></textarea>
+            <p class="field-error" id="f-picked-err" role="alert" hidden></p>
+          </div>
+
+          <div class="field">
+            <label for="f-right">The right answer</label>
+            <p class="hint" id="f-right-hint">Optional, but it helps us explain the difference.</p>
+            <textarea id="f-right" name="right" rows="2" aria-describedby="f-right-hint f-right-err"></textarea>
+            <p class="field-error" id="f-right-err" role="alert" hidden></p>
+          </div>
+
+          <div class="actions">
+            <button type="submit" class="btn primary" id="go">Find the trap</button>
+            <button type="button" class="btn quiet" id="clear">Clear</button>
+          </div>
+
+          <p class="examples" id="examples">Not sure what to paste? Load an example:</p>
+        </form>
+
+        <div id="status" class="status" role="status" aria-live="polite"></div>
+        <div id="result" class="result" tabindex="-1"></div>
+      </section>
+
+      <section id="view-notebook" hidden aria-label="Notebook"></section>
+      <section id="view-patterns" hidden aria-label="Patterns"></section>
+
+      <p class="footnote">Your notebook is saved in your Anna account. The question you paste is sent to Anna's AI to write the feedback.</p>
+    </main>
+  </div>
+</body>
+</html>
