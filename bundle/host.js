@@ -106,10 +106,16 @@ export async function complete({ system, messages, maxTokens = 2600, temperature
   if (system) req.systemPrompt = system;
   if (Number.isFinite(maxTokens)) req.maxTokens = maxTokens;
   if (Number.isFinite(temperature)) req.temperature = temperature;
+  // Per the host-api-llm reference, complete's second argument is the documented
+  // opts bag: { timeoutMs?: number }. The SDK per-namespace timeout default is
+  // 180 000 ms (3 minutes); we override with our app-level cap (LLM_TIMEOUT_MS).
+  // Our own withTimeout race stays in place as a belt-and-suspenders fallback
+  // so a host that ignores opts still surfaces a clean 'timeout' HostError.
+  const opts = Number.isFinite(timeoutMs) ? { timeoutMs } : undefined;
   let res;
   try {
     res = await withTimeout(
-      Promise.resolve(host.llm.complete(req)),
+      Promise.resolve(host.llm.complete(req, opts)),
       timeoutMs,
       'timeout',
       'The AI took too long to answer.',

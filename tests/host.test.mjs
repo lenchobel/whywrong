@@ -100,6 +100,18 @@ test('complete turns an empty content object into a HostError', async () => {
   await assert.rejects(complete({ system: 's', messages: [] }), (e) => e.code === 'llm_empty');
 });
 
+test('complete passes { timeoutMs } as the documented second argument to llm.complete', async () => {
+  let seenArgs, seenOpts;
+  fakeAnna({ llm: { complete: async (args, opts) => { seenArgs = args; seenOpts = opts; return { content: { type: 'text', text: 'ok' } }; } } });
+  await complete({ system: 's', messages: [{ role: 'user', content: 'hi' }] }, 12345);
+  // The docs pin complete's signature as (args, opts?: {timeoutMs?: number}).
+  assert.equal(typeof seenOpts, 'object', 'llm.complete was called with an opts object');
+  assert.equal(seenOpts.timeoutMs, 12345, 'timeoutMs flows through to the SDK');
+  // The request shape itself is unchanged.
+  assert.equal(seenArgs.systemPrompt, 's');
+  assert.deepEqual(seenArgs.messages, [{ role: 'user', content: 'hi' }]);
+});
+
 test('complete gives up when the AI takes too long', async () => {
   fakeAnna({ llm: { complete: () => new Promise(() => {}) } });
   await assert.rejects(complete({ system: 's', messages: [] }, 30), (e) => e instanceof HostError && e.code === 'timeout');
