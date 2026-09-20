@@ -4,19 +4,52 @@
 //   node tests/e2e.mjs            run all scenarios
 //   SHOTS=dir node tests/e2e.mjs  also save screenshots to dir
 //
-// Needs Playwright with Chromium installed.
+// Needs Playwright with Chromium installed. The loader prefers a
+// project-local install (npm i -D playwright + npx playwright install
+// chromium) and falls back to a PLAYWRIGHT_DIR env var for environments
+// that ship Playwright elsewhere on disk.
 
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bundle = path.join(here, '..', 'bundle');
-const req = createRequire(process.env.PLAYWRIGHT_DIR || '/home/claude/.npm-global/lib/node_modules/x.js');
-const { chromium } = req('playwright');
+
+async function loadChromium() {
+  try {
+    const mod = await import('playwright');
+    return mod.chromium;
+  } catch {
+    const req = createRequire(process.env.PLAYWRIGHT_DIR || '/home/claude/.npm-global/lib/node_modules/x.js');
+    return req('playwright').chromium;
+  }
+}
+const chromium = await loadChromium();
+
+// Pick the installed browser binary. Recent Playwright defaults to
+// chrome-headless-shell, but on networks where that download fails the
+// full chromium binary is still on disk — use it as a fallback so e2e
+// still runs. Returns undefined to let Playwright pick its own default.
+function findBrowserExecutable() {
+  const dir = process.env.PLAYWRIGHT_BROWSERS_PATH || path.join(os.homedir(), 'AppData', 'Local', 'ms-playwright');
+  if (!fs.existsSync(dir)) return undefined;
+  const entries = fs.readdirSync(dir).filter((d) => d.startsWith('chromium'));
+  for (const e of entries) {
+    const cand = path.join(dir, e, 'chrome-headless-shell-win64', 'chrome-headless-shell.exe');
+    if (fs.existsSync(cand)) return cand;
+  }
+  for (const e of entries) {
+    const cand = path.join(dir, e, 'chrome-win64', 'chrome.exe');
+    if (fs.existsSync(cand)) return cand;
+  }
+  return undefined;
+}
+
 const SHOTS = process.env.SHOTS || '';
 if (SHOTS) fs.mkdirSync(SHOTS, { recursive: true });
 
@@ -26,6 +59,8 @@ const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 's
 let serveSdk = true;
 const server = http.createServer((rq, rs) => {
   const url = new URL(rq.url, 'http://x').pathname;
+  // Browsers auto-request /favicon.ico. Return a 204 to keep console clean.
+  if (url === '/favicon.ico') { rs.writeHead(204); return rs.end(); }
   let file;
   if (url === '/static/anna-apps/_sdk/latest/index.js') {
     if (!serveSdk) { rs.writeHead(404); return rs.end('no sdk'); }
@@ -35,7 +70,10 @@ const server = http.createServer((rq, rs) => {
     if (!file.startsWith(bundle)) { rs.writeHead(403); return rs.end(); }
   }
   fs.readFile(file, (err, buf) => {
-    if (err) { rs.writeHead(404); return rs.end('not found'); }
+    if (err) {
+      console.error(`e2e 404: ${url}`);
+      rs.writeHead(404); return rs.end('not found');
+    }
     rs.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'text/plain', 'content-security-policy': CSP });
     rs.end(buf);
   });
@@ -43,7 +81,7 @@ const server = http.createServer((rq, rs) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const BASE = `http://127.0.0.1:${server.address().port}/`;
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({ executablePath: findBrowserExecutable() ?? undefined });
 
 // ---- helpers -----------------------------------------------------------------
 
@@ -102,7 +140,15 @@ const shotEl = async (page, selector, name) => {
   await page.waitForTimeout(1600);
   await page.locator(selector).first().screenshot({ path: path.join(SHOTS, `${name}.png`) });
 };
-const storeNotebook = (page) => page.evaluate(() => JSON.parse(globalThis.__WW.store.get('notebook') || '[]'));
+const storeNotebook = (page) => page.evaluate(() => {
+  // The bundle now stores the raw array (storage.set({value: array})); the
+  // legacy fallback is a JSON string. Accept both.
+  const v = globalThis.__WW.store.get('notebook');
+  if (v == null) return [];
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') return JSON.parse(v);
+  return [];
+});
 const callCount = (page) => page.evaluate(() => globalThis.__WW.calls.length);
 
 const good = () => JSON.stringify({
@@ -170,7 +216,8 @@ await scenario('happy path: diagnose, practice, save, notebook, mark, patterns',
   await shot(page, 'desktop-notebook');
 
   await page.click('.tab[data-view=patterns]');
-  assert.match(await page.textContent('#view-patterns'), /Save three mistakes/);
+  assert.match(await page.textContent('#view-patterns'), /1 mistake in the last 7 days/, 'Patterns shows from the first saved mistake (Bug 2 fix)');
+  assert.match(await page.textContent('#view-patterns'), /Save a few more/, 'Patterns hints that more mistakes are needed for a real pattern');
   clean(problems);
   await ctx.close();
 });
@@ -261,8 +308,8 @@ await scenario('a set() that reports OK but does not store shows "did not stick"
   assert.equal(await page.locator('.save-row .btn.primary:has-text("Save to notebook")').count(), 1, 'save button still available');
   // Notebook stays empty.
   assert.equal((await storeNotebook(page)).length, 0);
-  // Tab count stays at 0.
-  assert.equal((await page.textContent('#nb-count')).trim(), '');
+  // Tab count stays hidden (no saved items).
+  assert.equal(await page.locator('#nb-count').isVisible(), false, 'count badge hidden when notebook is empty');
   clean(problems);
   await ctx.close();
 });

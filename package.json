@@ -8,5 +8,8 @@
     "test:e2e": "node tests/e2e.mjs",
     "dev": "anna-app dev",
     "validate": "anna-app validate --strict"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
   }
 }
