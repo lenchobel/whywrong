@@ -49,17 +49,30 @@ const anna = {
     async get({ key } = {}) {
       const w = W();
       if (w.getFails) throw new Error('storage service unavailable');
-      if (!w.store.has(key)) return { value: null, exists: false };
-      return { value: w.store.get(key), exists: true };
+      if (!w.store.has(key)) return { value: null, exists: false, etag: null };
+      return { value: w.store.get(key), exists: true, etag: w.etag, generation: w.generation };
     },
-    async set({ key, value } = {}) {
+    async set({ key, value, if_match } = {}) {
       const w = W();
       w.setCalls += 1;
       if (w.setFails) throw new Error('quota exceeded');
+      // Simulate APS optimistic concurrency: if the caller passes an etag that
+      // doesn't match the current one, surface precondition_failed instead of
+      // clobbering. Tests that don't simulate a concurrent writer leave etag
+      // unset so writes always succeed.
+      if (if_match != null && if_match !== w.etag) {
+        const err = new Error('precondition failed');
+        err.code = 'precondition_failed';
+        throw err;
+      }
       // silentSet: set() reports OK but does NOT actually write — used to
       // verify that the bundle's read-back check catches a flaky backend.
-      if (!w.silentSet) w.store.set(key, value);
-      return { ok: true };
+      if (!w.silentSet) {
+        w.store.set(key, value);
+        w.generation = (w.generation || 0) + 1;
+        w.etag = `W/"${w.generation}"`;
+      }
+      return { etag: w.etag, generation: w.generation, size_bytes: 0 };
     },
   },
 };

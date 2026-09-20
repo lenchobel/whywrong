@@ -109,9 +109,14 @@ async function ensureNotebook() {
   return state.notebook;
 }
 
-async function persist(next) {
-  await saveNotebook(next);
-  state.notebook = next;
+async function persist(merge) {
+  // `merge` is a function (currentList) => nextList. saveNotebook re-reads
+  // inside, runs the merge against the fresh list, and writes with if_match
+  // so a concurrent save from another tab or device is not clobbered.
+  const next = await saveNotebook(merge);
+  // Refresh the cached notebook from storage so the screen reflects the
+  // post-merge state (including any concurrent changes we just merged in).
+  state.notebook = await loadNotebook();
   updateCount();
 }
 
@@ -448,7 +453,9 @@ function renderSaveRow() {
       const list = await ensureNotebook();
       const full = list.length >= LIMITS.notebook;
       const item = makeItem(state.current.input, state.current.diagnosis);
-      await persist(addItem(list, item));
+      // Merge: re-read inside saveNotebook and place the new item on top,
+      // so a save from another tab or device is not clobbered.
+      await persist((current) => addItem(current, item));
       state.current.savedId = item.id;
       paint();
       if (full) note.textContent = `Your notebook holds ${LIMITS.notebook} mistakes, so the oldest one was removed.`;
@@ -459,6 +466,8 @@ function renderSaveRow() {
         // backend silently dropped the write. Keep the save button enabled
         // so the student can try again.
         note.textContent = err.message;
+      } else if (err instanceof HostError && err.code === 'storage_conflict') {
+        note.textContent = 'Your notebook was being changed elsewhere. Try again.';
       } else if (state.notebookError) {
         note.textContent = "Your notebook couldn't be loaded, so nothing was saved. Try again.";
       } else {
@@ -555,7 +564,7 @@ function entryEl(it, { paintList, notice }) {
   const fail = (err) => notice.replaceChildren(h('div', { class: 'notice', role: 'alert' }, h('p', {}, (err instanceof HostError && err.code === 'save_not_stuck') ? err.message : "That change didn't save. Try again.")));
   const change = async (next, after) => {
     try {
-      await persist(next);
+      await persist(() => next);
       notice.replaceChildren();
       paintList();
       if (after) after();

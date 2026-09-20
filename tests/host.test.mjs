@@ -226,3 +226,96 @@ test('saveNotebook succeeds when the read-back matches what was written (same id
   } });
   await saveNotebook(notebook); // should not throw
 });
+
+// ---- Bug B: data loss across concurrent saves ------------------------------
+// The notebook is one key, loaded once and rewritten whole on every save.
+// Two tabs can clobber each other. Fix: re-read inside saveNotebook so the
+// merge function sees the latest data, and use if_match so a write that races
+// with another write fails fast and retries.
+
+// Etag-aware mock that lets the test simulate a concurrent writer mutating
+// the store between saveNotebook's internal read and write.
+function fakeAnnaWithEtag(initialList) {
+  const store = new Map();
+  if (initialList) store.set('notebook', initialList);
+  let gen = initialList ? 1 : 0;
+  const anna = {
+    llm: { complete: async () => ({ content: { type: 'text', text: 'ok' } }) },
+    storage: {
+      async get({ key } = {}) {
+        if (!store.has(key)) return { value: null, exists: false, etag: null };
+        return { value: store.get(key), exists: true, etag: `W/"${gen}"`, generation: gen };
+      },
+      async set({ key, value, if_match } = {}) {
+        if (if_match != null && if_match !== `W/"${gen}"`) {
+          const err = new Error('precondition failed');
+          err.code = 'precondition_failed';
+          throw err;
+        }
+        store.set(key, value);
+        gen += 1;
+        return { etag: `W/"${gen}"`, generation: gen, size_bytes: 0 };
+      },
+    },
+  };
+  globalThis.AnnaAppRuntime = { async connect() { return anna; } };
+  return { store, anna };
+}
+
+const makeFixture = (id) => ({
+  id, createdAt: 1000, question: 'q', picked: 'p', right: '', trapId: 'leap', whyTempting: 'w',
+  trapWords: [], rule: 'r', check: 'c', whyRight: '', drills: [], mastered: false,
+});
+
+test('saveNotebook re-reads inside so a concurrent store change is not lost', async () => {
+  const { store } = fakeAnnaWithEtag([makeFixture('a'), makeFixture('b')]);
+  // "Another tab" adds a third item between our load and our save.
+  store.set('notebook', [makeFixture('a'), makeFixture('b'), makeFixture('d')]);
+  // saveNotebook receives a merge function. With the fix it must re-read,
+  // run the merge against the fresh list, and not clobber 'd'.
+  await saveNotebook((current) => [makeFixture('c'), ...current]);
+  const final = store.get('notebook').map((x) => x.id);
+  for (const id of ['a', 'b', 'c', 'd']) assert.ok(final.includes(id), `kept ${id}`);
+  assert.equal(final.length, 4);
+});
+
+test('saveNotebook uses if_match so a write that races with another write retries instead of clobbering', async () => {
+  const { store, anna } = fakeAnnaWithEtag([makeFixture('a'), makeFixture('b')]);
+  let setCalls = 0;
+  const origSet = anna.storage.set;
+  anna.storage.set = async (args) => {
+    setCalls += 1;
+    if (setCalls === 1) {
+      // Simulate a second tab that wrote between our read and our write.
+      // APS would surface this as precondition_failed because the row's
+      // etag moved while we were holding the stale one.
+      store.set('notebook', [makeFixture('a'), makeFixture('b'), makeFixture('d')]);
+      // Bump the mock's generation so the original set() rejects our stale if_match.
+      // We reach into the mock's gen by triggering a no-op set that does bump it.
+      try { await origSet({ key: 'notebook', value: store.get('notebook') }); } catch { /* ignore */ }
+      // Now retry with the (now stale) original args.
+      return origSet(args);
+    }
+    return origSet(args);
+  };
+  await saveNotebook((current) => [makeFixture('c'), ...current]);
+  // The first attempt's if_match was stale -> precondition_failed -> retry
+  // that re-reads, merges, and writes the full [a, b, d, c] list.
+  assert.ok(setCalls >= 2, 'retried after the race');
+  const final = store.get('notebook').map((x) => x.id);
+  for (const id of ['a', 'b', 'c', 'd']) assert.ok(final.includes(id), `kept ${id}`);
+  assert.equal(final.length, 4);
+});
+
+test('saveNotebook gives up after three precondition_failed races with storage_conflict', async () => {
+  const { anna } = fakeAnnaWithEtag([makeFixture('a')]);
+  anna.storage.set = async () => {
+    const err = new Error('still racing');
+    err.code = 'precondition_failed';
+    throw err;
+  };
+  await assert.rejects(
+    saveNotebook((current) => current),
+    (e) => e instanceof HostError && e.code === 'storage_conflict',
+  );
+});

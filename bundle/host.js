@@ -130,12 +130,20 @@ export async function complete({ system, messages, maxTokens = 2600, temperature
 }
 
 // ---- Storage ----------------------------------------------------------------
-// Documented shapes:
-//   anna.storage.get({ key }) -> { value, etag?, generation?, exists }
+// Documented shapes (host-api-storage.md):
+//   anna.storage.get({ key }) -> { value, etag, generation, exists }
 //     missing key -> { value: null, exists: false }  (NO throw)
-//   anna.storage.set({ key, value }) -> { etag, generation, size_bytes } or { ok: true }
-// The default (scope='app', owner=self) bucket needs no further grant; only
-// `manifest.ui.host_api.storage` must list the method name.
+//   anna.storage.set({ key, value, if_match? }) -> { etag, generation, size_bytes }
+// The default (scope='app', owner=self) bucket is per-(user, App) — see the
+// reference page — so no scope arg is needed and other users of this App see
+// a different bucket. APS supports optimistic concurrency via `if_match`:
+// pass the etag from the most recent get/set and a concurrent write surfaces
+// as `precondition_failed` instead of silently clobbering our row.
+// Limits: key <= 1024 chars (<= 128 per segment); value any JSON; legacy
+// runtime_state backend caps the whole bucket at 256 KiB; APS enforces a
+// per-row byte cap and per-user entry/byte quota.
+
+const SAVE_MAX_ATTEMPTS = 3;
 
 export async function loadNotebook() {
   const host = await connect();
@@ -150,29 +158,53 @@ export async function loadNotebook() {
   return parseNotebook(res.value);
 }
 
-export async function saveNotebook(list) {
+// `merge` is either a function (currentList) => nextList, or — for back-compat
+// — a literal nextList. The merge-function form lets the caller describe the
+// CHANGE it wants (add, toggle, delete by id) without rebuilding the whole
+// list, which is what makes this safe under concurrent writers.
+export async function saveNotebook(merge) {
+  const apply = typeof merge === 'function' ? merge : () => merge;
   const host = await connect();
-  try {
-    await host.storage.set({ key: NOTEBOOK_KEY, value: list });
-  } catch (err) {
-    throw new HostError('storage_write', 'Your notebook could not be saved.', err);
-  }
-  // A "Saved to notebook" button is a lie if the next reload is empty. Read
-  // back and compare ids + mastered flags before reporting success.
-  let res;
-  try {
-    res = await host.storage.get({ key: NOTEBOOK_KEY });
-  } catch (err) {
-    throw new HostError('save_not_stuck', 'It looked like it saved, but reading it back failed.', err);
-  }
-  if (!res || res.exists === false) {
-    console.warn('[WhyWrong] save did not stick: storage reported OK but read-back was empty');
-    throw new HostError('save_not_stuck', 'It looked like it saved, but it did not stick, so it may be gone when you close the app. Try again.');
-  }
-  const readback = parseNotebook(res.value);
-  if (!sameNotebookShape(list, readback)) {
-    console.warn('[WhyWrong] save did not stick: wrote', list.map(slimItem).join(','), 'read back', readback.map(slimItem).join(','));
-    throw new HostError('save_not_stuck', 'It looked like it saved, but it did not stick, so it may be gone when you close the app. Try again.');
+  for (let attempt = 0; attempt < SAVE_MAX_ATTEMPTS; attempt++) {
+    let cur;
+    try {
+      cur = await host.storage.get({ key: NOTEBOOK_KEY });
+    } catch (err) {
+      throw new HostError('storage_read', 'Your notebook could not be saved.', err);
+    }
+    const current = (cur && cur.exists !== false) ? parseNotebook(cur.value) : [];
+    const next = apply(current);
+    const writeArgs = { key: NOTEBOOK_KEY, value: next };
+    if (cur && cur.etag) writeArgs.if_match = cur.etag;
+    try {
+      await host.storage.set(writeArgs);
+    } catch (err) {
+      // Concurrent writer touched the row between our read and our write.
+      // Retry: re-read, re-apply the merge against the fresh list, write again.
+      if (err?.code === 'precondition_failed' && attempt < SAVE_MAX_ATTEMPTS - 1) continue;
+      if (err?.code === 'precondition_failed') {
+        throw new HostError('storage_conflict', 'Your notebook was being changed elsewhere. Please try again.', err);
+      }
+      throw new HostError('storage_write', 'Your notebook could not be saved.', err);
+    }
+    // A "Saved to notebook" button is a lie if the next reload is empty. Read
+    // back and compare ids + mastered flags before reporting success.
+    let res;
+    try {
+      res = await host.storage.get({ key: NOTEBOOK_KEY });
+    } catch (err) {
+      throw new HostError('save_not_stuck', 'It looked like it saved, but reading it back failed.', err);
+    }
+    if (!res || res.exists === false) {
+      console.warn('[WhyWrong] save did not stick: storage reported OK but read-back was empty');
+      throw new HostError('save_not_stuck', 'It looked like it saved, but it did not stick, so it may be gone when you close the app. Try again.');
+    }
+    const readback = parseNotebook(res.value);
+    if (!sameNotebookShape(next, readback)) {
+      console.warn('[WhyWrong] save did not stick: wrote', next.map(slimItem).join(','), 'read back', readback.map(slimItem).join(','));
+      throw new HostError('save_not_stuck', 'It looked like it saved, but it did not stick, so it may be gone when you close the app. Try again.');
+    }
+    return;
   }
 }
 
