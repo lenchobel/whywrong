@@ -1,5 +1,13 @@
 // A stand-in for Anna's SDK, used only by the browser tests.
 // Behaviour is controlled from the test through globalThis.__WW.
+//
+// Pinned to the documented surface:
+//   - exports AnnaAppRuntime (matches the real SDK) so bundle/host.js's static
+//     `import { AnnaAppRuntime } from "/static/anna-apps/_sdk/latest/index.js"`
+//     resolves here.
+//   - llm.complete(args) -> { content: { type: "text", text } }
+//   - storage.get({ key }) -> { value, exists }
+//   - storage.set({ key, value }) -> { ok: true } (legacy runtime_state shape)
 
 const W = () => globalThis.__WW;
 
@@ -25,7 +33,7 @@ function defaultReply(args) {
   });
 }
 
-export const anna = {
+const anna = {
   llm: {
     async complete(args) {
       const w = W();
@@ -34,24 +42,35 @@ export const anna = {
       if (next.error) throw new Error(next.error);
       if (next.hang) return new Promise(() => {});
       if (next.delay) await new Promise((r) => setTimeout(r, next.delay));
-      return { text: next.text };
+      return { content: { type: 'text', text: next.text } };
     },
   },
   storage: {
-    async get(key) {
+    async get({ key } = {}) {
       const w = W();
       if (w.getFails) throw new Error('storage service unavailable');
-      if (!w.store.has(key)) throw new Error('Key not found');
-      return { key, value: w.store.get(key) };
+      if (!w.store.has(key)) return { value: null, exists: false };
+      return { value: w.store.get(key), exists: true };
     },
-    async set(key, value) {
+    async set({ key, value } = {}) {
       const w = W();
       w.setCalls += 1;
       if (w.setFails) throw new Error('quota exceeded');
       w.store.set(key, value);
-      return { key, value };
+      return { ok: true };
     },
   },
 };
 
+// Match the real SDK's surface: bundle/host.js does `import { AnnaAppRuntime }
+// from "/static/anna-apps/_sdk/latest/index.js"`, so this module must export
+// the named binding `AnnaAppRuntime` with a `.connect()` method.
+export const AnnaAppRuntime = {
+  async connect() {
+    return anna;
+  },
+};
+
+// Back-compat exports for any test that imported the proxy directly.
+export { anna };
 export default anna;

@@ -7,33 +7,47 @@ const notebook = [{
   trapWords: [], rule: 'r', check: 'c', whyRight: '', drills: [], mastered: false,
 }];
 
+// Mirror the documented SDK surface so bundle/host.js talks to it the same way
+// the real runtime would:
+//   AnnaAppRuntime.connect() -> anna
+//   anna.llm.complete(args) -> { content: { type: 'text', text } }
+//   anna.storage.get({ key }) -> { value, exists }
+//   anna.storage.set({ key, value }) -> { ok: true }
 function fakeAnna(over = {}) {
   const store = new Map();
-  globalThis.anna = {
-    llm: { complete: async () => ({ text: 'hello' }) },
+  const anna = {
+    llm: {
+      complete: async () => ({ content: { type: 'text', text: 'hello' } }),
+    },
     storage: {
-      get: async (k) => { if (!store.has(k)) throw new Error('Key not found'); return { key: k, value: store.get(k) }; },
-      set: async (k, v) => { store.set(k, v); return { key: k, value: v }; },
+      get: async ({ key }) => {
+        if (!store.has(key)) return { value: null, exists: false };
+        return { value: store.get(key), exists: true };
+      },
+      set: async ({ key, value }) => { store.set(key, value); return { ok: true }; },
     },
     ...over,
+  };
+  globalThis.AnnaAppRuntime = {
+    async connect() {
+      return anna;
+    },
   };
   return store;
 }
 
 beforeEach(() => {
   _resetForTests();
-  delete globalThis.anna;
+  delete globalThis.AnnaAppRuntime;
 });
 
-test('extractText understands the reply shapes an AI host might use', () => {
-  assert.equal(extractText('plain'), 'plain');
-  assert.equal(extractText({ text: 'a' }), 'a');
-  assert.equal(extractText({ output_text: 'b' }), 'b');
+// The docs pin the LLM response to MCP shape: { content: { type: 'text', text } }.
+// Defensive cases (string, plain content) are covered but the documented one
+// must work.
+test('extractText returns the documented content.text', () => {
+  assert.equal(extractText({ content: { type: 'text', text: 'hello' } }), 'hello');
   assert.equal(extractText({ content: 'c' }), 'c');
-  assert.equal(extractText({ content: [{ type: 'text', text: 'd1' }, { type: 'text', text: 'd2' }] }), 'd1d2');
-  assert.equal(extractText({ message: { content: 'e' } }), 'e');
-  assert.equal(extractText({ choices: [{ message: { content: 'f' } }] }), 'f');
-  assert.equal(extractText({ result: { text: 'g' } }), 'g');
+  assert.equal(extractText('plain'), 'plain');
   assert.equal(extractText({}), '');
   assert.equal(extractText(null), '');
   assert.equal(extractText(undefined), '');
@@ -49,14 +63,26 @@ test('connect can be retried after a failure', async () => {
   assert.ok(await connect());
 });
 
-test('complete passes the request through and returns the text', async () => {
+test('complete sends systemPrompt + maxTokens + messages in the documented shape', async () => {
   let seen;
-  fakeAnna({ llm: { complete: async (args) => { seen = args; return { content: [{ text: 'answer' }] }; } } });
+  fakeAnna({ llm: { complete: async (args) => { seen = args; return { content: { type: 'text', text: 'answer' } }; } } });
   const out = await complete({ system: 'sys', messages: [{ role: 'user', content: 'hi' }] });
   assert.equal(out, 'answer');
-  assert.equal(seen.system, 'sys');
-  assert.equal(seen.messages[0].content, 'hi');
-  assert.equal(typeof seen.max_tokens, 'number');
+  assert.equal(seen.systemPrompt, 'sys');
+  assert.deepEqual(seen.messages, [{ role: 'user', content: 'hi' }]);
+  assert.equal(typeof seen.maxTokens, 'number');
+  assert.equal(seen.max_tokens, undefined, 'snake_case max_tokens must not be sent');
+});
+
+test('complete omits systemPrompt when no system text is given', async () => {
+  let seen;
+  fakeAnna({ llm: { complete: async (args) => { seen = args; return { content: { type: 'text', text: 'ok' } }; } } });
+  await complete({ messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(seen.systemPrompt, undefined);
+  // maxTokens / temperature have app-level defaults; we always send them so
+  // the LLM gets a stable JSON-friendly config.
+  assert.equal(typeof seen.maxTokens, 'number');
+  assert.equal(typeof seen.temperature, 'number');
 });
 
 test('complete turns a failed AI call into a HostError', async () => {
@@ -65,7 +91,12 @@ test('complete turns a failed AI call into a HostError', async () => {
 });
 
 test('complete turns an empty reply into a HostError', async () => {
-  fakeAnna({ llm: { complete: async () => ({ text: '   ' }) } });
+  fakeAnna({ llm: { complete: async () => ({ content: { type: 'text', text: '   ' } }) } });
+  await assert.rejects(complete({ system: 's', messages: [] }), (e) => e.code === 'llm_empty');
+});
+
+test('complete turns an empty content object into a HostError', async () => {
+  fakeAnna({ llm: { complete: async () => ({ content: { type: 'text', text: '' } }) } });
   await assert.rejects(complete({ system: 's', messages: [] }), (e) => e.code === 'llm_empty');
 });
 
@@ -74,41 +105,59 @@ test('complete gives up when the AI takes too long', async () => {
   await assert.rejects(complete({ system: 's', messages: [] }, 30), (e) => e instanceof HostError && e.code === 'timeout');
 });
 
+// Per docs, storage.get returns { value: null, exists: false } on a missing key
+// (no throw). loadNotebook must surface that as an empty list.
 test('loadNotebook returns an empty list when nothing has been saved yet', async () => {
   fakeAnna();
   assert.deepEqual(await loadNotebook(), []);
 });
 
-test('loadNotebook reads a saved notebook whichever way storage returns it', async () => {
-  const raw = JSON.stringify(notebook);
-  fakeAnna({ storage: { get: async () => ({ value: raw }), set: async () => ({}) } });
+test('loadNotebook reads a saved notebook array directly', async () => {
+  fakeAnna({ storage: { get: async ({ key }) => ({ value: notebook, exists: true }), set: async () => ({ ok: true }) } });
   assert.equal((await loadNotebook()).length, 1);
-  _resetForTests();
-  fakeAnna({ storage: { get: async () => raw, set: async () => ({}) } });
+});
+
+test('loadNotebook handles a JSON-string stored value', async () => {
+  fakeAnna({ storage: { get: async ({ key }) => ({ value: JSON.stringify(notebook), exists: true }), set: async () => ({ ok: true }) } });
   assert.equal((await loadNotebook()).length, 1);
-  _resetForTests();
-  fakeAnna({ storage: { get: async () => ({ value: notebook }), set: async () => ({}) } });
+});
+
+test('loadNotebook handles a wrapped { items } value', async () => {
+  fakeAnna({ storage: { get: async ({ key }) => ({ value: { items: notebook }, exists: true }), set: async () => ({ ok: true }) } });
   assert.equal((await loadNotebook()).length, 1);
 });
 
 test('loadNotebook treats damaged data as an empty notebook instead of crashing', async () => {
-  fakeAnna({ storage: { get: async () => ({ value: '{{{ broken' }), set: async () => ({}) } });
+  fakeAnna({ storage: { get: async ({ key }) => ({ value: '{{{ broken', exists: true }), set: async () => ({ ok: true }) } });
   assert.deepEqual(await loadNotebook(), []);
 });
 
 test('loadNotebook reports real storage failures instead of pretending the notebook is empty', async () => {
-  fakeAnna({ storage: { get: async () => { throw new Error('storage service unavailable'); }, set: async () => ({}) } });
+  fakeAnna({ storage: { get: async () => { throw new Error('storage service unavailable'); }, set: async () => ({ ok: true }) } });
   await assert.rejects(loadNotebook(), (e) => e instanceof HostError && e.code === 'storage_read');
 });
 
-test('saveNotebook stores JSON and a later load gets it back', async () => {
+test('saveNotebook stores an array directly (SDK serialises) and a later load gets it back', async () => {
   const store = fakeAnna();
   await saveNotebook(notebook);
-  assert.equal(typeof store.get('notebook'), 'string');
+  // Stored value is the raw array, NOT a stringified JSON blob.
+  assert.ok(Array.isArray(store.get('notebook')));
   assert.equal((await loadNotebook()).length, 1);
 });
 
+test('saveNotebook sends { key, value } with the array as value', async () => {
+  let seen;
+  fakeAnna({ storage: {
+    get: async ({ key }) => ({ value: null, exists: false }),
+    set: async (args) => { seen = args; return { ok: true }; },
+  } });
+  await saveNotebook(notebook);
+  assert.equal(seen.key, 'notebook');
+  assert.ok(Array.isArray(seen.value));
+  assert.equal(seen.value[0].id, 'a');
+});
+
 test('saveNotebook turns a storage failure into a HostError', async () => {
-  fakeAnna({ storage: { get: async () => ({ value: '[]' }), set: async () => { throw new Error('quota exceeded'); } } });
+  fakeAnna({ storage: { get: async () => ({ value: null, exists: false }), set: async () => { throw new Error('quota exceeded'); } } });
   await assert.rejects(saveNotebook(notebook), (e) => e instanceof HostError && e.code === 'storage_write');
 });

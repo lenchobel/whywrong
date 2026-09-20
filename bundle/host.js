@@ -1,11 +1,19 @@
 // host.js: the ONLY file that talks to the Anna runtime.
 //
 // If Anna's SDK differs from what is assumed here, fix it in this file and
-// nowhere else. Check these three calls against docs/app-ui-sdk.md,
-// docs/host-api-llm.md and docs/host-api-storage.md:
-//   1. how the SDK is imported          (connect)
-//   2. anna.llm.complete(...) arguments and the shape of what comes back
-//   3. anna.storage.get(key) / anna.storage.set(key, value)
+// nowhere else. The three calls below are pinned to the documented surface:
+//   1. SDK import -> AnnaAppRuntime.connect()
+//   2. anna.llm.complete({ messages, systemPrompt, maxTokens, ... }) -> reply.content.text
+//   3. anna.storage.get({ key }) / anna.storage.set({ key, value })
+// See:
+//   https://anna.partners/developers/apps/app-ui-sdk.md
+//   https://anna.partners/developers/apps/llm-and-agent.md
+//   https://anna.partners/developers/reference/host-api-llm.md
+//   https://anna.partners/developers/reference/host-api-storage.md
+//
+// The SDK module is fetched dynamically so a missing host (tests, broken
+// network) doesn't crash the bundle; a globalThis.AnnaAppRuntime binding is
+// honoured as a fallback for the unit-test path.
 
 import { parseNotebook } from './core.js';
 
@@ -35,18 +43,25 @@ export function connect() {
   if (sdk) return Promise.resolve(sdk);
   if (!connecting) {
     connecting = (async () => {
-      let found = null;
+      let Runtime = null;
       try {
-        const mod = await import(SDK_URL);
-        found = mod.anna || mod.default || null;
+        const mod = await import(/* @vite-ignore */ SDK_URL);
+        Runtime = mod?.AnnaAppRuntime || mod?.default?.AnnaAppRuntime || null;
       } catch {
-        // fall through to the global check below
+        // No SDK reachable (Node unit tests, offline). Fall back to the
+        // global binding if a host page (tests, harness) injected one.
       }
-      if (!found && globalThis.anna && typeof globalThis.anna === 'object') found = globalThis.anna;
-      if (!found?.llm?.complete || !found?.storage?.get || !found?.storage?.set) {
+      if (!Runtime && globalThis.AnnaAppRuntime?.connect) {
+        Runtime = globalThis.AnnaAppRuntime;
+      }
+      if (typeof Runtime?.connect !== 'function') {
         throw new HostError('no_runtime', 'This app has to run inside Anna. Open it from the Anna marketplace or with anna-app dev.');
       }
-      sdk = found;
+      const anna = await Runtime.connect();
+      if (!anna?.llm?.complete || !anna?.storage?.get || !anna?.storage?.set) {
+        throw new HostError('no_runtime', 'This app has to run inside Anna. Open it from the Anna marketplace or with anna-app dev.');
+      }
+      sdk = anna;
       return sdk;
     })().catch((err) => {
       connecting = null;
@@ -57,20 +72,18 @@ export function connect() {
 }
 
 // ---- helpers that read whatever shape comes back ----------------------------
+// Per the host-api-llm reference, the documented LLM-complete response is:
+//   { role: 'assistant', content: { type: 'text', text }, model, stopReason, usage, _meta? }
+// The defensive branches cover a bare string and a string content field —
+// nothing else is part of the public surface.
 
 export function extractText(res) {
   if (typeof res === 'string') return res;
   if (!res || typeof res !== 'object') return '';
-  if (typeof res.text === 'string') return res.text;
-  if (typeof res.output_text === 'string') return res.output_text;
-  if (typeof res.content === 'string') return res.content;
-  if (Array.isArray(res.content)) {
-    return res.content.map((c) => (typeof c === 'string' ? c : c?.text || '')).join('');
+  if (res.content && typeof res.content === 'object' && typeof res.content.text === 'string') {
+    return res.content.text;
   }
-  if (typeof res.message?.content === 'string') return res.message.content;
-  if (typeof res.choices?.[0]?.message?.content === 'string') return res.choices[0].message.content;
-  if (typeof res.result === 'string') return res.result;
-  if (res.result && typeof res.result === 'object') return extractText(res.result);
+  if (typeof res.content === 'string') return res.content;
   return '';
 }
 
@@ -83,13 +96,20 @@ function withTimeout(promise, ms, code, message) {
 }
 
 // ---- AI ---------------------------------------------------------------------
+// Internal signature stays the same ({ system, messages, maxTokens, temperature })
+// so callers (core.js) do not change; we translate `system` -> `systemPrompt`
+// and `maxTokens` -> camelCase at the boundary.
 
 export async function complete({ system, messages, maxTokens = 2600, temperature = 0.4 }, timeoutMs = LLM_TIMEOUT_MS) {
   const host = await connect();
+  const req = { messages };
+  if (system) req.systemPrompt = system;
+  if (Number.isFinite(maxTokens)) req.maxTokens = maxTokens;
+  if (Number.isFinite(temperature)) req.temperature = temperature;
   let res;
   try {
     res = await withTimeout(
-      Promise.resolve(host.llm.complete({ system, messages, max_tokens: maxTokens, temperature })),
+      Promise.resolve(host.llm.complete(req)),
       timeoutMs,
       'timeout',
       'The AI took too long to answer.',
@@ -104,26 +124,30 @@ export async function complete({ system, messages, maxTokens = 2600, temperature
 }
 
 // ---- Storage ----------------------------------------------------------------
-
-const MISSING = /not.?found|no such|missing|does not exist|doesn't exist|404|no value/i;
+// Documented shapes:
+//   anna.storage.get({ key }) -> { value, etag?, generation?, exists }
+//     missing key -> { value: null, exists: false }  (NO throw)
+//   anna.storage.set({ key, value }) -> { etag, generation, size_bytes } or { ok: true }
+// The default (scope='app', owner=self) bucket needs no further grant; only
+// `manifest.ui.host_api.storage` must list the method name.
 
 export async function loadNotebook() {
   const host = await connect();
   let res;
   try {
-    res = await host.storage.get(NOTEBOOK_KEY);
+    res = await host.storage.get({ key: NOTEBOOK_KEY });
   } catch (err) {
-    if (MISSING.test(String(err?.message || err))) return [];
     throw new HostError('storage_read', 'Your notebook could not be loaded.', err);
   }
-  if (res && typeof res === 'object' && !Array.isArray(res) && 'value' in res) res = res.value;
-  return parseNotebook(res);
+  // Branch on `exists` (NOT on `value`) — storing null is legal and round-trips.
+  if (!res || res.exists === false) return [];
+  return parseNotebook(res.value);
 }
 
 export async function saveNotebook(list) {
   const host = await connect();
   try {
-    await host.storage.set(NOTEBOOK_KEY, JSON.stringify(list));
+    await host.storage.set({ key: NOTEBOOK_KEY, value: list });
   } catch (err) {
     throw new HostError('storage_write', 'Your notebook could not be saved.', err);
   }
