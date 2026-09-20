@@ -216,6 +216,74 @@ test('diagnoseWith lets a failed platform call through so the screen can show an
   await assert.rejects(() => diagnoseWith(async () => { throw new Error('boom'); }, input), /boom/);
 });
 
+// ---- verdict: correct ----------------------------------------------------------
+// Bug 1: the AI may decide the picked answer is actually right (the student
+// marked it wrong by mistake, or the answer key says otherwise). The reply
+// shape is { ok: true, verdict: "correct", why: "..." } and the flow must
+// surface it as its own outcome — no trap, no drills, no retry.
+
+test('buildRequest tells the AI to FIRST decide if the picked answer is correct', () => {
+  const { system } = buildRequest(input);
+  // Must instruct the AI to check correctness before picking a trap.
+  assert.match(system, /FIRST/i);
+  assert.match(system, /picked answer is (actually )?correct/i);
+  assert.match(system, /verdict/i);
+  // Must document the new correct-reply shape.
+  assert.match(system, /"verdict":\s*"correct"/);
+  assert.match(system, /"why":/);
+});
+
+test('validateDiagnosis returns a correct outcome for verdict: "correct"', () => {
+  const r = validateDiagnosis({ ok: true, verdict: 'correct', why: 'It matches the passage exactly.' }, { picked: input.picked });
+  assert.equal(r.ok, false);
+  assert.equal(r.correct, true);
+  assert.equal(r.refused, undefined);
+  assert.equal(r.reason, 'It matches the passage exactly.');
+});
+
+test('validateDiagnosis accepts a normal reply that explicitly says verdict: "wrong"', () => {
+  const r = validateDiagnosis(good({ verdict: 'wrong' }), { picked: input.picked });
+  assert.equal(r.ok, true);
+  assert.equal(r.value.trapId, 'too_extreme');
+});
+
+test('validateDiagnosis accepts a normal reply with no verdict field (back-compat)', () => {
+  const r = validateDiagnosis(good(), { picked: input.picked });
+  assert.equal(r.ok, true);
+  assert.equal(r.value.trapId, 'too_extreme');
+});
+
+test('validateDiagnosis rejects verdict: "correct" with no why string', () => {
+  const r = validateDiagnosis({ ok: true, verdict: 'correct', why: '   ' }, { picked: input.picked });
+  assert.equal(r.ok, false);
+  assert.equal(r.correct, true);
+  // Should still have a sensible reason (a fallback) so the screen never
+  // shows an empty notice.
+  assert.ok(r.reason && r.reason.length > 0, 'correct outcome has a fallback reason');
+});
+
+test('diagnoseWith returns { kind: "correct" } without retrying', async () => {
+  let calls = 0;
+  const out = await diagnoseWith(async () => {
+    calls += 1;
+    return '{"ok": true, "verdict": "correct", "why": "Your answer matches the passage."}';
+  }, input);
+  assert.equal(calls, 1, 'no retry on a correct verdict');
+  assert.equal(out.kind, 'correct');
+  assert.equal(out.reason, 'Your answer matches the passage.');
+  assert.equal(out.value, undefined);
+});
+
+test('diagnoseWith returns correct verdict even when the right answer is empty', async () => {
+  let calls = 0;
+  const out = await diagnoseWith(async () => {
+    calls += 1;
+    return '{"ok": true, "verdict": "correct", "why": "Matches the passage."}';
+  }, { ...input, right: '' });
+  assert.equal(calls, 1);
+  assert.equal(out.kind, 'correct');
+});
+
 // ---- highlighting --------------------------------------------------------------
 
 test('splitHighlights marks words case-insensitively and keeps the original text', () => {

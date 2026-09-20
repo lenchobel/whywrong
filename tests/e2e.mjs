@@ -217,6 +217,35 @@ await scenario('one bad reply is retried automatically and the student never see
   await ctx.close();
 });
 
+// Bug 1: when the AI says the picked answer is correct, the screen shows an
+// info notice with the reason, an "Add the right answer" button that focuses
+// the right-answer box, no trap and no drills, nothing saved.
+await scenario('correct verdict: info notice + add-the-right-answer button, no trap, no save', async () => {
+  const correctText = JSON.stringify({
+    ok: true, verdict: 'correct', why: 'The picked answer is supported by the passage, just like the right answer.',
+  });
+  const { page, ctx, problems } = await open({ llm: [{ text: correctText }] });
+  await runSample(page, 0);
+  await page.waitForSelector('#status .notice.info', { timeout: 5000 });
+  const notice = await page.textContent('#status');
+  assert.match(notice, /Good news: your answer looks right/);
+  assert.match(notice, /supported by the passage/);
+  assert.match(notice, /Add the right answer/);
+  // No trap, no drills, no save row.
+  assert.equal(await page.locator('#result .trap-name').count(), 0, 'no trap rendered');
+  assert.equal(await page.locator('.drill').count(), 0, 'no drills rendered');
+  assert.equal(await page.locator('.save-row .btn.primary').count(), 0, 'no save button rendered');
+  // Only one AI call — no retry on a correct verdict.
+  assert.equal(await callCount(page), 1, 'no retry on verdict:correct');
+  // Nothing written to the notebook.
+  assert.equal((await storeNotebook(page)).length, 0);
+  // The button focuses the right-answer box.
+  await page.getByRole('button', { name: 'Add the right answer' }).click();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'f-right');
+  clean(problems);
+  await ctx.close();
+});
+
 await scenario('two bad replies show a friendly error and Try again works', async () => {
   const { page, ctx, problems } = await open({ llm: [{ text: 'nope' }, { text: '{"ok":true,"trap_id":"bogus"}' }] });
   await runSample(page, 0);

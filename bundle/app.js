@@ -230,6 +230,20 @@ async function runDiagnosis(input) {
     if (outcome.kind === 'ok') {
       state.current = { input, diagnosis: outcome.value, savedId: null };
       renderResult({ animate: true });
+    } else if (outcome.kind === 'correct') {
+      // Picked answer is actually right. Show an info notice only. No trap,
+      // no drills, nothing saved.
+      $('#result').replaceChildren();
+      state.current = null;
+      showNotice({
+        info: true,
+        lines: [
+          "Good news: your answer looks right.",
+          outcome.reason,
+          'If the answer key says otherwise, add the right answer and try again so we can compare them.',
+        ],
+        actions: [{ label: 'Add the right answer', onClick: () => fields.right.input().focus() }],
+      });
     } else if (outcome.kind === 'refused') {
       showNotice({
         info: true,
