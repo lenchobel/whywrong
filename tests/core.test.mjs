@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   LIMITS, TRAPS, TRAP_IDS, trapById, checkInput, buildRequest, parseModelJson, validateDiagnosis,
   splitHighlights, makeItem, parseNotebook, addItem, removeItem, toggleMastered, filterItems,
-  weekStats, exportText, diagnoseWith,
+  weekStats, exportText, diagnoseWith, allTimeStats,
 } from '../bundle/core.js';
 
 const good = (over = {}) => ({
@@ -216,6 +216,130 @@ test('diagnoseWith lets a failed platform call through so the screen can show an
   await assert.rejects(() => diagnoseWith(async () => { throw new Error('boom'); }, input), /boom/);
 });
 
+// ---- verdict: correct ----------------------------------------------------------
+// Bug 1: the AI may decide the picked answer is actually right (the student
+// marked it wrong by mistake, or the answer key says otherwise). The reply
+// shape is { ok: true, verdict: "correct", why: "..." } and the flow must
+// surface it as its own outcome — no trap, no drills, no retry.
+
+test('buildRequest tells the AI to FIRST decide if the picked answer is correct', () => {
+  const { system } = buildRequest(input);
+  // Must instruct the AI to check correctness before picking a trap.
+  assert.match(system, /FIRST/i);
+  assert.match(system, /picked answer is (actually )?correct/i);
+  assert.match(system, /verdict/i);
+  // Must document the new correct-reply shape.
+  assert.match(system, /"verdict":\s*"correct"/);
+  assert.match(system, /"why":/);
+});
+
+test('validateDiagnosis returns a correct outcome for verdict: "correct"', () => {
+  const r = validateDiagnosis({ ok: true, verdict: 'correct', why: 'It matches the passage exactly.' }, { picked: input.picked });
+  assert.equal(r.ok, false);
+  assert.equal(r.correct, true);
+  assert.equal(r.refused, undefined);
+  assert.equal(r.reason, 'It matches the passage exactly.');
+});
+
+test('validateDiagnosis accepts a normal reply that explicitly says verdict: "wrong"', () => {
+  const r = validateDiagnosis(good({ verdict: 'wrong' }), { picked: input.picked });
+  assert.equal(r.ok, true);
+  assert.equal(r.value.trapId, 'too_extreme');
+});
+
+test('validateDiagnosis accepts a normal reply with no verdict field (back-compat)', () => {
+  const r = validateDiagnosis(good(), { picked: input.picked });
+  assert.equal(r.ok, true);
+  assert.equal(r.value.trapId, 'too_extreme');
+});
+
+test('validateDiagnosis rejects verdict: "correct" with no why string', () => {
+  const r = validateDiagnosis({ ok: true, verdict: 'correct', why: '   ' }, { picked: input.picked });
+  assert.equal(r.ok, false);
+  assert.equal(r.correct, true);
+  // Should still have a sensible reason (a fallback) so the screen never
+  // shows an empty notice.
+  assert.ok(r.reason && r.reason.length > 0, 'correct outcome has a fallback reason');
+});
+
+test('diagnoseWith returns { kind: "correct" } without retrying when there is no right-vs-picked conflict', async () => {
+  let calls = 0;
+  const out = await diagnoseWith(async () => {
+    calls += 1;
+    return '{"ok": true, "verdict": "correct", "why": "Your answer matches the passage."}';
+  }, { ...input, right: '' });
+  assert.equal(calls, 1, 'no retry on a correct verdict');
+  assert.equal(out.kind, 'correct');
+  assert.equal(out.reason, 'Your answer matches the passage.');
+  assert.equal(out.value, undefined);
+});
+
+test('diagnoseWith returns correct verdict even when the right answer is empty', async () => {
+  let calls = 0;
+  const out = await diagnoseWith(async () => {
+    calls += 1;
+    return '{"ok": true, "verdict": "correct", "why": "Matches the passage."}';
+  }, { ...input, right: '' });
+  assert.equal(calls, 1);
+  assert.equal(out.kind, 'correct');
+});
+
+// ---- Verdict trust (Bug C) --------------------------------------------------
+// When the student gives a right answer that differs from the picked answer,
+// and the AI says the pick is correct anyway, we don't trust the AI on the
+// first reply — we retry once with a note about the conflict. If it still
+// says correct, the screen surfaces the conflict so the student can ask their
+// teacher.
+
+test('diagnoseWith retries once when student-supplied right answer disagrees with a correct verdict', async () => {
+  const seen = [];
+  const replies = [
+    '{"ok": true, "verdict": "correct", "why": "Pick matches the passage."}',
+    '{"ok": true, "verdict": "correct", "why": "Still think so."}',
+  ];
+  const out = await diagnoseWith(async (req) => { seen.push(req.messages[0].content); return replies.shift(); }, input);
+  assert.equal(out.kind, 'correct_conflict');
+  assert.equal(seen.length, 2);
+  assert.ok(!seen[0].includes('your last reply said'), 'first reply is not annotated as a retry');
+  assert.match(seen[1], /your last reply said/i, 'retry note references the conflict');
+});
+
+test('diagnoseWith returns { kind: "ok" } if the conflict retry produces a real diagnosis', async () => {
+  const replies = [
+    '{"ok": true, "verdict": "correct", "why": "Pick matches."}',
+    JSON.stringify(good()),
+  ];
+  const out = await diagnoseWith(async () => replies.shift(), input);
+  assert.equal(out.kind, 'ok');
+  assert.equal(out.value.trapId, 'too_extreme');
+});
+
+test('diagnoseWith does NOT retry on a correct verdict when no right answer was given', async () => {
+  let calls = 0;
+  const out = await diagnoseWith(async () => {
+    calls += 1;
+    return '{"ok": true, "verdict": "correct", "why": "Matches the passage."}';
+  }, { ...input, right: '' });
+  assert.equal(calls, 1, 'no conflict to resolve');
+  assert.equal(out.kind, 'correct');
+});
+
+test('diagnoseWith does NOT retry on a correct verdict when right answer equals the picked answer', async () => {
+  let calls = 0;
+  const out = await diagnoseWith(async () => {
+    calls += 1;
+    return '{"ok": true, "verdict": "correct", "why": "Matches."}';
+  }, { ...input, right: input.picked });
+  assert.equal(calls, 1, 'no conflict to resolve');
+  assert.equal(out.kind, 'correct');
+});
+
+test('buildRequest uses a "Note on your last reply" prefix for conflict retries', () => {
+  const r = buildRequest(input, 'The picked and right answers disagree.', { reason: 'conflict' });
+  assert.match(r.messages[0].content, /Note on your last reply/);
+  assert.doesNotMatch(r.messages[0].content, /could not be used/);
+});
+
 // ---- highlighting --------------------------------------------------------------
 
 test('splitHighlights marks words case-insensitively and keeps the original text', () => {
@@ -264,6 +388,55 @@ test('addItem puts the newest first, dedupes by id, and caps the list', () => {
   assert.equal(list.length, LIMITS.notebook);
   assert.equal(list[0].id, `n${LIMITS.notebook + 4}`);
   assert.equal(addItem([item('a')], item('a')).length, 1);
+});
+
+test('a full notebook of typical entries stays safely under the 256 KiB bucket cap', () => {
+  // A realistic entry: a ~600-char question, and 3 drills each with a ~400-char
+  // stem, 4 options and 4 explanations. The legacy bucket caps the whole state
+  // at 256 KiB, so LIMITS.notebook must keep a full notebook of typical
+  // entries well under it (with the old cap of 100 it was ~413 KiB).
+  const clip = (s, n) => (s.length > n ? s.slice(0, n).trimEnd() : s);
+  const question = clip('A passage describes a city that introduced a congestion fee in its historic centre. Council records show traffic counts fell by 18% in the first year, while shop owners reported mixed results: some said fewer cars meant fewer customers, others said deliveries were faster and the streets felt safer. The city also added a free shuttle every ten minutes and repaved two side streets with the fee revenue. Question: what does the passage suggest about the congestion fee, and how does the passage support it?', 600);
+  const picked = clip('The fee eliminated traffic in the historic centre, because the council records show that cars went down by a lot in the very first year after it started.', 600);
+  const right = clip('The fee reduced traffic, though not every owner thought it helped business: some shops lost customers while deliveries got faster and the streets felt safer.', 600);
+  const stem = clip('A town adds a small charge for cars entering the market street on Saturdays. The council says more people now arrive by bus, but some market traders say they sell less because regular customers stopped coming. What does this story suggest about the market street charge?', 400);
+  const drill = () => ({
+    stem,
+    options: [
+      clip('The charge made everyone who shops at the market richer than before.', 300),
+      clip('The charge changed how some people travel and had mixed effects on traders.', 300),
+      clip('The charge had no effect at all on anyone in the town.', 300),
+      clip('The council built a new car park instead of charging for the street.', 300),
+    ],
+    correct: 1,
+    trapOption: 0,
+    explanations: [
+      clip('Wrong: the story says some traders sell less, so not everyone is richer.', 300),
+      clip('Right: travel changed for some people and traders report mixed results.', 300),
+      clip('Wrong: bus use and trader sales both changed, so there was an effect.', 300),
+      clip('Wrong: the story says the town charges cars, not that it built a car park.', 300),
+    ],
+  });
+  const entry = makeItem(
+    { question, picked, right },
+    {
+      trapId: 'half_right',
+      whyTempting: clip('It sounds right because the records do show cars went down, and the picked answer says traffic was eliminated.', 400),
+      trapWords: ['eliminated', 'by a lot'],
+      rule: clip('An answer is only right if every part of it is right. One wrong piece makes the whole choice wrong.', 400),
+      check: clip('Split the answer into its parts. Does the text support each part?', 300),
+      whyRight: clip('The right answer keeps the parts the text supports and does not overstate them.', 400),
+      drills: [drill(), drill(), drill()],
+    },
+    { now: Date.UTC(2026, 8, 19), id: 'mabcdef12345' },
+  );
+  const bytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');
+  assert.equal(bytes, 4132, 'typical entry is ~4 KiB');
+  assert.equal(LIMITS.notebook, 25, 'cap chosen so 25 typical entries (~101 KiB) sit well under 256 KiB');
+  assert.ok(
+    LIMITS.notebook * bytes < 256 * 1024 * 0.75,
+    `a full notebook of typical entries would be ${((LIMITS.notebook * bytes) / 1024).toFixed(0)} KiB — needs >= 25% headroom`,
+  );
 });
 
 test('removeItem and toggleMastered only touch the chosen entry', () => {
@@ -326,6 +499,39 @@ test('weekStats breaks ties by the fixed trap order, so results do not jump arou
   const now = Date.now();
   const list = [item('a', { trapId: 'leap', createdAt: now }), item('b', { trapId: 'too_extreme', createdAt: now })];
   assert.equal(weekStats(list, now).top.id, 'too_extreme');
+});
+
+// ---- all-time stats (Bug 2: Patterns falls back when last-7-days is empty) ---
+
+test('allTimeStats returns an empty shape for an empty notebook', () => {
+  const s = allTimeStats([]);
+  assert.equal(s.total, 0);
+  assert.equal(s.top, null);
+  assert.deepEqual(s.byTrap, []);
+});
+
+test('allTimeStats ranks every saved mistake, not just the last 7 days', () => {
+  const now = Date.UTC(2026, 8, 20, 12);
+  const day = 86400000;
+  const list = [
+    item('a', { trapId: 'half_right', createdAt: now - day }),
+    item('b', { trapId: 'half_right', createdAt: now - 2 * day }),
+    item('c', { trapId: 'leap', createdAt: now - 3 * day }),
+    item('d', { trapId: 'leap', createdAt: now - 20 * day }), // older than 7 days
+    item('e', { trapId: 'opposite', createdAt: now - 6.5 * day, mastered: true }),
+  ];
+  const s = allTimeStats(list);
+  assert.equal(s.total, 5);
+  assert.equal(s.top.id, 'half_right');
+  assert.equal(s.top.count, 2);
+});
+
+test('allTimeStats counts a single mistake as the top trap', () => {
+  const now = Date.now();
+  const s = allTimeStats([item('a', { trapId: 'not_in_text', createdAt: now })]);
+  assert.equal(s.total, 1);
+  assert.equal(s.top.id, 'not_in_text');
+  assert.equal(s.top.count, 1);
 });
 
 // ---- export --------------------------------------------------------------------

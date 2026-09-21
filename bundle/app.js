@@ -3,7 +3,7 @@
 
 import {
   LIMITS, TRAPS, trapById, checkInput, diagnoseWith, splitHighlights,
-  makeItem, addItem, removeItem, toggleMastered, filterItems, weekStats, exportText,
+  makeItem, addItem, removeItem, toggleMastered, filterItems, weekStats, allTimeStats, exportText,
 } from './core.js';
 import { connect, complete, loadNotebook, saveNotebook, HostError } from './host.js';
 import { SAMPLES } from './samples.js';
@@ -109,9 +109,14 @@ async function ensureNotebook() {
   return state.notebook;
 }
 
-async function persist(next) {
-  await saveNotebook(next);
-  state.notebook = next;
+async function persist(merge) {
+  // `merge` is a function (currentList) => nextList. saveNotebook re-reads
+  // inside, runs the merge against the fresh list, and writes with if_match
+  // so a concurrent save from another tab or device is not clobbered.
+  const next = await saveNotebook(merge);
+  // Refresh the cached notebook from storage so the screen reflects the
+  // post-merge state (including any concurrent changes we just merged in).
+  state.notebook = await loadNotebook();
   updateCount();
 }
 
@@ -230,6 +235,34 @@ async function runDiagnosis(input) {
     if (outcome.kind === 'ok') {
       state.current = { input, diagnosis: outcome.value, savedId: null };
       renderResult({ animate: true });
+    } else if (outcome.kind === 'correct') {
+      // Picked answer is actually right. Show an info notice only. No trap,
+      // no drills, nothing saved.
+      $('#result').replaceChildren();
+      state.current = null;
+      showNotice({
+        info: true,
+        lines: [
+          "Good news: your answer looks right.",
+          outcome.reason,
+          'If the answer key says otherwise, add the right answer and try again so we can compare them.',
+        ],
+        actions: [{ label: 'Add the right answer', onClick: () => fields.right.input().focus() }],
+      });
+    } else if (outcome.kind === 'correct_conflict') {
+      // Picked answer is right AND the student's right answer disagrees with
+      // it. We asked the AI twice; it still says correct. Surface the conflict
+      // so the student can ask their teacher.
+      $('#result').replaceChildren();
+      state.current = null;
+      showNotice({
+        info: true,
+        lines: [
+          outcome.reason,
+          "The AI thinks your answer says the same as the right answer you gave. If your answer key disagrees, check it with your teacher.",
+        ],
+        actions: [{ label: 'Add the right answer', onClick: () => fields.right.input().focus() }],
+      });
     } else if (outcome.kind === 'refused') {
       showNotice({
         info: true,
@@ -434,15 +467,30 @@ function renderSaveRow() {
       const list = await ensureNotebook();
       const full = list.length >= LIMITS.notebook;
       const item = makeItem(state.current.input, state.current.diagnosis);
-      await persist(addItem(list, item));
+      // Merge: re-read inside saveNotebook and place the new item on top,
+      // so a save from another tab or device is not clobbered.
+      await persist((current) => addItem(current, item));
       state.current.savedId = item.id;
       paint();
       if (full) note.textContent = `Your notebook holds ${LIMITS.notebook} mistakes, so the oldest one was removed.`;
-    } catch {
+    } catch (err) {
       paint();
-      note.textContent = state.notebookError
-        ? "Your notebook couldn't be loaded, so nothing was saved. Try again."
-        : "That didn't save. Try again.";
+      if (err instanceof HostError && err.code === 'save_not_stuck') {
+        // The set() returned OK but the read-back differs — the storage
+        // backend silently dropped the write. Keep the save button enabled
+        // so the student can try again.
+        note.textContent = err.message;
+      } else if (err instanceof HostError && err.code === 'storage_conflict') {
+        note.textContent = 'Your notebook was being changed elsewhere. Try again.';
+      } else if (err instanceof HostError && err.code === 'notebook_full') {
+        // The backend rejected the write as too big. The message is the
+        // user-facing sentence set in host.js; nothing is marked saved.
+        note.textContent = err.message;
+      } else if (state.notebookError) {
+        note.textContent = "Your notebook couldn't be loaded, so nothing was saved. Try again.";
+      } else {
+        note.textContent = "That didn't save. Try again.";
+      }
     }
   };
 
@@ -531,15 +579,15 @@ async function retryNotebook() {
 function entryEl(it, { paintList, notice }) {
   const trap = trapById(it.trapId);
 
-  const fail = () => notice.replaceChildren(h('div', { class: 'notice', role: 'alert' }, h('p', {}, "That change didn't save. Try again.")));
+  const fail = (err) => notice.replaceChildren(h('div', { class: 'notice', role: 'alert' }, h('p', {}, (err instanceof HostError && err.code === 'save_not_stuck') ? err.message : "That change didn't save. Try again.")));
   const change = async (next, after) => {
     try {
-      await persist(next);
+      await persist(() => next);
       notice.replaceChildren();
       paintList();
       if (after) after();
-    } catch {
-      fail();
+    } catch (err) {
+      fail(err);
     }
   };
 
@@ -644,44 +692,63 @@ function renderPatterns() {
     return;
   }
 
-  const stats = weekStats(state.notebook);
-
-  if (state.notebook.length < 3) {
+  // Empty notebook: a friendly one-line nudge, no chart, no headline.
+  if (state.notebook.length === 0) {
     root.append(
       h('div', { class: 'empty' },
-        h('p', { class: 'lede' }, 'Save three mistakes and this page shows which trap catches you most, plus the rule that beats it.'),
-        h('p', { class: 'tally' }, `${plural(state.notebook.length, 'mistake', 'mistakes')} saved so far.`),
+        h('p', { class: 'lede' }, 'Save a mistake and this page shows which trap catches you most, plus the rule that beats it.'),
         h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn primary', onclick: () => showView('diagnose') }, 'Diagnose a mistake'))),
     );
     return;
   }
 
-  if (!stats.top) {
-    root.append(
-      h('p', { class: 'lede' }, 'Nothing saved in the last 7 days. Your older mistakes are still in the notebook.'),
-      h('p', { class: 'tally' }, `${plural(stats.stillTricky, 'saved mistake', 'saved mistakes')} still marked tricky.`),
-    );
-    return;
-  }
+  // Pick the data window. If the last 7 days has any mistakes, use that;
+  // otherwise fall back to the whole notebook so the page is never blank.
+  const recent = weekStats(state.notebook);
+  const useRecent = recent.total > 0;
+  const stats = useRecent ? recent : allTimeStats(state.notebook);
+  const windowText = useRecent ? 'in the last 7 days' : 'in your notebook';
 
-  const top = trapById(stats.top.id);
-  const max = stats.top.count;
+  // With fewer than 3 mistakes the top trap is a hint, not a real pattern.
+  // Still show the rule and bar so the screen has something to act on.
+  const stillEarly = state.notebook.length < 3;
+  const top = stats.top;
+
+  const headline = stillEarly
+    ? h('p', { class: 'big-line' },
+        `So far you have ${plural(stats.total, 'mistake', 'mistakes')} ${windowText}. The trap so far: `,
+        h('strong', {}, trapById(top.id).name),
+        `. Save a few more and this page shows your real pattern.`)
+    : h('p', { class: 'big-line' },
+        `${capitalize(windowText)} you saved ${plural(stats.total, 'mistake', 'mistakes')}. The trap that got you most was `,
+        h('strong', {}, trapById(top.id).name),
+        ` (${top.count} of ${stats.total}).`);
+
+  const max = stats.top ? stats.top.count : 1;
+  const bars = stats.byTrap.map((row, i) => {
+    const fill = h('div', { class: 'bar-fill' });
+    fill.style.setProperty('--w', `${Math.round((row.count / max) * 100)}%`);
+    return h('li', { class: `bar-row${i === 0 ? ' top' : ''}` },
+      h('span', { class: 'bar-name' }, trapById(row.id).name),
+      h('div', { class: 'bar-track', 'aria-hidden': 'true' }, fill),
+      h('span', { class: 'bar-count' }, String(row.count)));
+  });
+
   root.append(
-    h('p', { class: 'big-line' }, `In the last 7 days you saved ${plural(stats.total, 'mistake', 'mistakes')}. The trap that got you most was `, h('strong', {}, top.name), ` (${stats.top.count} of ${stats.total}).`),
-    h('div', { class: 'part' }, h('h3', {}, 'The rule that beats it'), h('p', { class: 'rule-text' }, top.rule),
-      h('div', { class: 'check-text' }, h('h3', {}, 'Ask yourself'), h('p', {}, top.check))),
-    h('ul', { class: 'bars', 'aria-label': 'Mistakes by trap, last 7 days' },
-      stats.byTrap.map((row, i) => {
-        const fill = h('div', { class: 'bar-fill' });
-        fill.style.setProperty('--w', `${Math.round((row.count / max) * 100)}%`);
-        return h('li', { class: `bar-row${i === 0 ? ' top' : ''}` },
-          h('span', { class: 'bar-name' }, trapById(row.id).name),
-          h('div', { class: 'bar-track', 'aria-hidden': 'true' }, fill),
-          h('span', { class: 'bar-count' }, String(row.count)));
-      })),
-    h('p', { class: 'tally' }, `${plural(stats.stillTricky, 'mistake', 'mistakes')} in your notebook still marked tricky.`),
+    headline,
+    h('div', { class: 'part' },
+      h('h3', {}, 'The rule that beats it'),
+      h('p', { class: 'rule-text' }, trapById(top.id).rule),
+      h('div', { class: 'check-text' }, h('h3', {}, 'Ask yourself'), h('p', {}, trapById(top.id).check))),
+    h('ul', { class: 'bars', 'aria-label': `Mistakes by trap, ${windowText}` }, bars),
+    h('p', { class: 'tally' }, `${plural(recent.stillTricky, 'mistake', 'mistakes')} in your notebook still marked tricky.`),
+    stillEarly
+      ? h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn quiet', onclick: () => showView('diagnose') }, 'Diagnose another mistake'))
+      : null,
   );
 }
+
+function capitalize(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
 
 // ---------------------------------------------------------------------------
 // Start up

@@ -4,19 +4,52 @@
 //   node tests/e2e.mjs            run all scenarios
 //   SHOTS=dir node tests/e2e.mjs  also save screenshots to dir
 //
-// Needs Playwright with Chromium installed.
+// Needs Playwright with Chromium installed. The loader prefers a
+// project-local install (npm i -D playwright + npx playwright install
+// chromium) and falls back to a PLAYWRIGHT_DIR env var for environments
+// that ship Playwright elsewhere on disk.
 
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bundle = path.join(here, '..', 'bundle');
-const req = createRequire(process.env.PLAYWRIGHT_DIR || '/home/claude/.npm-global/lib/node_modules/x.js');
-const { chromium } = req('playwright');
+
+async function loadChromium() {
+  try {
+    const mod = await import('playwright');
+    return mod.chromium;
+  } catch {
+    const req = createRequire(process.env.PLAYWRIGHT_DIR || '/home/claude/.npm-global/lib/node_modules/x.js');
+    return req('playwright').chromium;
+  }
+}
+const chromium = await loadChromium();
+
+// Pick the installed browser binary. Recent Playwright defaults to
+// chrome-headless-shell, but on networks where that download fails the
+// full chromium binary is still on disk — use it as a fallback so e2e
+// still runs. Returns undefined to let Playwright pick its own default.
+function findBrowserExecutable() {
+  const dir = process.env.PLAYWRIGHT_BROWSERS_PATH || path.join(os.homedir(), 'AppData', 'Local', 'ms-playwright');
+  if (!fs.existsSync(dir)) return undefined;
+  const entries = fs.readdirSync(dir).filter((d) => d.startsWith('chromium'));
+  for (const e of entries) {
+    const cand = path.join(dir, e, 'chrome-headless-shell-win64', 'chrome-headless-shell.exe');
+    if (fs.existsSync(cand)) return cand;
+  }
+  for (const e of entries) {
+    const cand = path.join(dir, e, 'chrome-win64', 'chrome.exe');
+    if (fs.existsSync(cand)) return cand;
+  }
+  return undefined;
+}
+
 const SHOTS = process.env.SHOTS || '';
 if (SHOTS) fs.mkdirSync(SHOTS, { recursive: true });
 
@@ -26,6 +59,8 @@ const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 's
 let serveSdk = true;
 const server = http.createServer((rq, rs) => {
   const url = new URL(rq.url, 'http://x').pathname;
+  // Browsers auto-request /favicon.ico. Return a 204 to keep console clean.
+  if (url === '/favicon.ico') { rs.writeHead(204); return rs.end(); }
   let file;
   if (url === '/static/anna-apps/_sdk/latest/index.js') {
     if (!serveSdk) { rs.writeHead(404); return rs.end('no sdk'); }
@@ -35,7 +70,10 @@ const server = http.createServer((rq, rs) => {
     if (!file.startsWith(bundle)) { rs.writeHead(403); return rs.end(); }
   }
   fs.readFile(file, (err, buf) => {
-    if (err) { rs.writeHead(404); return rs.end('not found'); }
+    if (err) {
+      console.error(`e2e 404: ${url}`);
+      rs.writeHead(404); return rs.end('not found');
+    }
     rs.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'text/plain', 'content-security-policy': CSP });
     rs.end(buf);
   });
@@ -43,7 +81,7 @@ const server = http.createServer((rq, rs) => {
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const BASE = `http://127.0.0.1:${server.address().port}/`;
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({ executablePath: findBrowserExecutable() ?? undefined });
 
 // ---- helpers -----------------------------------------------------------------
 
@@ -70,7 +108,7 @@ const seedItem = (i, trapId, over = {}) => ({
   ...over,
 });
 
-async function open({ width = 1000, height = 900, seed = null, getFails = false, setFails = false, reducedMotion = 'no-preference', llm = [] } = {}) {
+async function open({ width = 1000, height = 900, seed = null, getFails = false, setFails = false, silentSet = false, setTooLarge = false, reducedMotion = 'no-preference', llm = [] } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, reducedMotion });
   const page = await ctx.newPage();
   const problems = [];
@@ -78,10 +116,10 @@ async function open({ width = 1000, height = 900, seed = null, getFails = false,
   page.on('console', (m) => {
     if (m.type() === 'error' || /Content Security Policy|Refused/.test(m.text())) problems.push(`console: ${m.text()}`);
   });
-  await page.addInitScript(({ seed, getFails, setFails, llm }) => {
-    globalThis.__WW = { llm, calls: [], store: new Map(), setCalls: 0, getFails, setFails };
+  await page.addInitScript(({ seed, getFails, setFails, silentSet, setTooLarge, llm }) => {
+    globalThis.__WW = { llm, calls: [], store: new Map(), setCalls: 0, getFails, setFails, silentSet, setTooLarge };
     if (seed) globalThis.__WW.store.set('notebook', JSON.stringify(seed));
-  }, { seed, getFails, setFails, llm });
+  }, { seed, getFails, setFails, silentSet, setTooLarge, llm });
   await page.goto(BASE);
   await page.waitForSelector('#examples .link');
   return { page, ctx, problems };
@@ -102,7 +140,15 @@ const shotEl = async (page, selector, name) => {
   await page.waitForTimeout(1600);
   await page.locator(selector).first().screenshot({ path: path.join(SHOTS, `${name}.png`) });
 };
-const storeNotebook = (page) => page.evaluate(() => JSON.parse(globalThis.__WW.store.get('notebook') || '[]'));
+const storeNotebook = (page) => page.evaluate(() => {
+  // The bundle now stores the raw array (storage.set({value: array})); the
+  // legacy fallback is a JSON string. Accept both.
+  const v = globalThis.__WW.store.get('notebook');
+  if (v == null) return [];
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') return JSON.parse(v);
+  return [];
+});
 const callCount = (page) => page.evaluate(() => globalThis.__WW.calls.length);
 
 const good = () => JSON.stringify({
@@ -170,7 +216,8 @@ await scenario('happy path: diagnose, practice, save, notebook, mark, patterns',
   await shot(page, 'desktop-notebook');
 
   await page.click('.tab[data-view=patterns]');
-  assert.match(await page.textContent('#view-patterns'), /Save three mistakes/);
+  assert.match(await page.textContent('#view-patterns'), /1 mistake in the last 7 days/, 'Patterns shows from the first saved mistake (Bug 2 fix)');
+  assert.match(await page.textContent('#view-patterns'), /Save a few more/, 'Patterns hints that more mistakes are needed for a real pattern');
   clean(problems);
   await ctx.close();
 });
@@ -214,6 +261,158 @@ await scenario('one bad reply is retried automatically and the student never see
   await waitResult(page);
   assert.equal(await callCount(page), 2);
   assert.equal(await page.locator('.notice').count(), 0);
+  await ctx.close();
+});
+
+// Bug C — verdict trust: when the AI insists the picked answer is correct
+// but the student gave a different right answer, we retry once and surface
+// the conflict so the student can ask their teacher.
+await scenario('correct-conflict: AI says correct twice with a right-vs-picked conflict, screen surfaces the conflict notice', async () => {
+  const correctText = JSON.stringify({
+    ok: true, verdict: 'correct', why: 'Pick matches the passage.',
+  });
+  // The sample question already has a right answer that differs from picked.
+  const { page, ctx, problems } = await open({ llm: [{ text: correctText }, { text: correctText }] });
+  await runSample(page, 0);
+  await page.waitForSelector('#status .notice.info', { timeout: 5000 });
+  const notice = await page.textContent('#status');
+  assert.match(notice, /AI thinks your answer says the same as the right answer/i);
+  assert.match(notice, /check it with your teacher/i);
+  assert.equal(await callCount(page), 2, 'retried once before showing the conflict');
+  // Nothing saved; no save row.
+  assert.equal(await page.locator('.save-row .btn.primary').count(), 0);
+  assert.equal((await storeNotebook(page)).length, 0);
+  clean(problems);
+  await ctx.close();
+});
+
+// Bug 1: when the AI says the picked answer is correct, the screen shows an
+// info notice with the reason, an "Add the right answer" button that focuses
+// the right-answer box, no trap and no drills, nothing saved.
+// The right answer is cleared before submitting: both samples ship a right
+// answer that differs from their picked answer, and since Fix C that case
+// retries once (exhausting the one-reply mock queue), so the plain
+// correct-verdict path is only reachable without a right answer.
+await scenario('correct verdict: info notice + add-the-right-answer button, no trap, no save', async () => {
+  const correctText = JSON.stringify({
+    ok: true, verdict: 'correct', why: 'The picked answer is supported by the passage, just like the right answer.',
+  });
+  const { page, ctx, problems } = await open({ llm: [{ text: correctText }] });
+  await page.locator('#examples .link').nth(0).click();
+  await page.fill('#f-right', '');
+  await page.click('#go');
+  await page.waitForSelector('#status .notice.info', { timeout: 5000 });
+  const notice = await page.textContent('#status');
+  assert.match(notice, /Good news: your answer looks right/);
+  assert.match(notice, /supported by the passage/);
+  assert.match(notice, /Add the right answer/);
+  // No trap, no drills, no save row.
+  assert.equal(await page.locator('#result .trap-name').count(), 0, 'no trap rendered');
+  assert.equal(await page.locator('.drill').count(), 0, 'no drills rendered');
+  assert.equal(await page.locator('.save-row .btn.primary').count(), 0, 'no save button rendered');
+  // Only one AI call — no retry on a correct verdict.
+  assert.equal(await callCount(page), 1, 'no retry on verdict:correct');
+  // Nothing written to the notebook.
+  assert.equal((await storeNotebook(page)).length, 0);
+  // The button focuses the right-answer box.
+  await page.getByRole('button', { name: 'Add the right answer' }).click();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'f-right');
+  clean(problems);
+  await ctx.close();
+});
+
+// Bug 2 — save readback
+await scenario('a set() that reports OK but does not store shows "did not stick" and never marks it saved', async () => {
+  const { page, ctx, problems } = await open({ silentSet: true });
+  await runSample(page, 0);
+  await waitResult(page);
+  await page.getByRole('button', { name: 'Save to notebook' }).click();
+  // The button must NOT flip to "Saved to notebook" because the read-back
+  // check failed.
+  await page.waitForSelector('.save-note', { timeout: 5000 });
+  const note = (await page.textContent('.save-note')) || '';
+  assert.match(note, /did not stick/i, 'shows the "did not stick" warning');
+  assert.equal(await page.locator('.save-row .btn.primary:has-text("Saved")').count(), 0, 'not marked as saved');
+  assert.equal(await page.locator('.save-row .btn.primary:has-text("Save to notebook")').count(), 1, 'save button still available');
+  // Notebook stays empty.
+  assert.equal((await storeNotebook(page)).length, 0);
+  // Tab count stays hidden (no saved items).
+  assert.equal(await page.locator('#nb-count').isVisible(), false, 'count badge hidden when notebook is empty');
+  clean(problems);
+  await ctx.close();
+});
+
+// Notebook size: a set() that rejects with value_too_large (the notebook hit
+// the backend's size cap) shows the "notebook is full" message and never
+// marks the entry saved.
+await scenario('notebook full: set() throws value_too_large, message shown, nothing saved', async () => {
+  const { page, ctx, problems } = await open({ setTooLarge: true });
+  await runSample(page, 0);
+  await waitResult(page);
+  await page.getByRole('button', { name: 'Save to notebook' }).click();
+  await page.waitForSelector('.save-note', { timeout: 5000 });
+  const note = (await page.textContent('.save-note')) || '';
+  assert.match(note, /Your notebook is full\. Delete some old mistakes and try again\./);
+  assert.equal(await page.locator('.save-row .btn.primary:has-text("Saved")').count(), 0, 'not marked as saved');
+  assert.equal(await page.locator('.save-row .btn.primary:has-text("Save to notebook")').count(), 1, 'save button still available');
+  assert.equal((await storeNotebook(page)).length, 0, 'nothing written to the notebook');
+  clean(problems);
+  await ctx.close();
+});
+
+// Bug 2 — Patterns page rendering for the various notebook states.
+await scenario('patterns: empty notebook shows the friendly empty message', async () => {
+  const { page, ctx, problems } = await open();
+  await page.click('.tab[data-view=patterns]');
+  await page.waitForSelector('#view-patterns .empty', { timeout: 5000 });
+  const text = await page.textContent('#view-patterns');
+  assert.match(text, /Save a mistake and this page shows/);
+  assert.equal(await page.locator('#view-patterns .bars').count(), 0, 'no bar chart on empty');
+  assert.equal(await page.locator('#view-patterns .big-line').count(), 0, 'no headline on empty');
+  clean(problems);
+  await ctx.close();
+});
+
+await scenario('patterns: one saved mistake shows the top trap and a "save a few more" hint', async () => {
+  const seedOne = [{
+    id: 's1', createdAt: Date.now(), question: 'A passage about traffic fees. Which statement is best supported?',
+    picked: 'The fee eliminated traffic.', right: 'The fee reduced traffic.',
+    trapId: 'too_extreme', whyTempting: 'Eliminated sounds stronger than the passage supports.',
+    trapWords: ['eliminated'], rule: 'Strong words need strong proof.',
+    check: 'Can I point to the line that proves every strong word?',
+    whyRight: 'Traffic fell, but the passage never says it stopped.',
+    drills: [], mastered: false,
+  }];
+  const { page, ctx, problems } = await open({ seed: seedOne });
+  await page.click('.tab[data-view=patterns]');
+  await page.waitForSelector('#view-patterns .bars', { timeout: 5000 });
+  const text = await page.textContent('#view-patterns');
+  assert.match(text, /1 mistake/);
+  assert.match(text, /Too extreme/);
+  assert.match(text, /save a few more/i);
+  assert.match(text, /real pattern/i);
+  clean(problems);
+  await ctx.close();
+});
+
+await scenario('patterns: only old mistakes fall back to the whole notebook, not last 7 days', async () => {
+  const veryOld = [{
+    id: 'o1', createdAt: Date.now() - 60 * 86400000, // 60 days ago
+    question: 'An old passage about traffic fees. Which statement is best supported?',
+    picked: 'The fee eliminated traffic.', right: 'The fee reduced traffic.',
+    trapId: 'too_extreme', whyTempting: 'Eliminated sounds stronger than the passage supports.',
+    trapWords: ['eliminated'], rule: 'Strong words need strong proof.',
+    check: 'Can I point to the line that proves every strong word?',
+    whyRight: 'Traffic fell, but the passage never says it stopped.',
+    drills: [], mastered: false,
+  }];
+  const { page, ctx, problems } = await open({ seed: veryOld });
+  await page.click('.tab[data-view=patterns]');
+  await page.waitForSelector('#view-patterns .bars', { timeout: 5000 });
+  const text = await page.textContent('#view-patterns');
+  assert.match(text, /in your notebook/i, 'falls back to whole-notebook language');
+  assert.match(text, /Too extreme/);
+  clean(problems);
   await ctx.close();
 });
 
