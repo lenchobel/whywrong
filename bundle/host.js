@@ -185,6 +185,13 @@ export async function saveNotebook(merge) {
       if (err?.code === 'precondition_failed') {
         throw new HostError('storage_conflict', 'Your notebook was being changed elsewhere. Please try again.', err);
       }
+      // The backend rejected the write because it is too big: APS caps each
+      // row (value_too_large), the legacy bucket caps the whole state at
+      // 256 KiB (state_too_large). Surface a full notebook and never report
+      // the entry as saved.
+      if (err?.code === 'value_too_large' || err?.code === 'state_too_large') {
+        throw new HostError('notebook_full', 'Your notebook is full. Delete some old mistakes and try again.', err);
+      }
       throw new HostError('storage_write', 'Your notebook could not be saved.', err);
     }
     // A "Saved to notebook" button is a lie if the next reload is empty. Read

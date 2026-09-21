@@ -108,7 +108,7 @@ const seedItem = (i, trapId, over = {}) => ({
   ...over,
 });
 
-async function open({ width = 1000, height = 900, seed = null, getFails = false, setFails = false, silentSet = false, reducedMotion = 'no-preference', llm = [] } = {}) {
+async function open({ width = 1000, height = 900, seed = null, getFails = false, setFails = false, silentSet = false, setTooLarge = false, reducedMotion = 'no-preference', llm = [] } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height }, reducedMotion });
   const page = await ctx.newPage();
   const problems = [];
@@ -116,10 +116,10 @@ async function open({ width = 1000, height = 900, seed = null, getFails = false,
   page.on('console', (m) => {
     if (m.type() === 'error' || /Content Security Policy|Refused/.test(m.text())) problems.push(`console: ${m.text()}`);
   });
-  await page.addInitScript(({ seed, getFails, setFails, silentSet, llm }) => {
-    globalThis.__WW = { llm, calls: [], store: new Map(), setCalls: 0, getFails, setFails, silentSet };
+  await page.addInitScript(({ seed, getFails, setFails, silentSet, setTooLarge, llm }) => {
+    globalThis.__WW = { llm, calls: [], store: new Map(), setCalls: 0, getFails, setFails, silentSet, setTooLarge };
     if (seed) globalThis.__WW.store.set('notebook', JSON.stringify(seed));
-  }, { seed, getFails, setFails, silentSet, llm });
+  }, { seed, getFails, setFails, silentSet, setTooLarge, llm });
   await page.goto(BASE);
   await page.waitForSelector('#examples .link');
   return { page, ctx, problems };
@@ -338,6 +338,24 @@ await scenario('a set() that reports OK but does not store shows "did not stick"
   assert.equal((await storeNotebook(page)).length, 0);
   // Tab count stays hidden (no saved items).
   assert.equal(await page.locator('#nb-count').isVisible(), false, 'count badge hidden when notebook is empty');
+  clean(problems);
+  await ctx.close();
+});
+
+// Notebook size: a set() that rejects with value_too_large (the notebook hit
+// the backend's size cap) shows the "notebook is full" message and never
+// marks the entry saved.
+await scenario('notebook full: set() throws value_too_large, message shown, nothing saved', async () => {
+  const { page, ctx, problems } = await open({ setTooLarge: true });
+  await runSample(page, 0);
+  await waitResult(page);
+  await page.getByRole('button', { name: 'Save to notebook' }).click();
+  await page.waitForSelector('.save-note', { timeout: 5000 });
+  const note = (await page.textContent('.save-note')) || '';
+  assert.match(note, /Your notebook is full\. Delete some old mistakes and try again\./);
+  assert.equal(await page.locator('.save-row .btn.primary:has-text("Saved")').count(), 0, 'not marked as saved');
+  assert.equal(await page.locator('.save-row .btn.primary:has-text("Save to notebook")').count(), 1, 'save button still available');
+  assert.equal((await storeNotebook(page)).length, 0, 'nothing written to the notebook');
   clean(problems);
   await ctx.close();
 });

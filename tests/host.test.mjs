@@ -319,3 +319,30 @@ test('saveNotebook gives up after three precondition_failed races with storage_c
     (e) => e instanceof HostError && e.code === 'storage_conflict',
   );
 });
+
+// ---- Notebook size: the backend rejects an over-cap write ------------------
+// APS caps each row (value_too_large) and the legacy runtime_state bucket caps
+// the whole state at 256 KiB (state_too_large). A full notebook must surface a
+// clear message and never be reported as saved.
+
+test('saveNotebook throws notebook_full when set() reports value_too_large', async () => {
+  fakeAnna({ storage: {
+    get: async () => ({ value: null, exists: false }),
+    set: async () => { const e = new Error('row too large'); e.code = 'value_too_large'; throw e; },
+  } });
+  await assert.rejects(
+    saveNotebook(notebook),
+    (e) => e instanceof HostError && e.code === 'notebook_full' && e.message === 'Your notebook is full. Delete some old mistakes and try again.',
+  );
+});
+
+test('saveNotebook throws notebook_full when set() reports state_too_large', async () => {
+  fakeAnna({ storage: {
+    get: async () => ({ value: null, exists: false }),
+    set: async () => { const e = new Error('bucket too large'); e.code = 'state_too_large'; throw e; },
+  } });
+  await assert.rejects(
+    saveNotebook(notebook),
+    (e) => e instanceof HostError && e.code === 'notebook_full',
+  );
+});

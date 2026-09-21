@@ -56,6 +56,13 @@ const anna = {
       const w = W();
       w.setCalls += 1;
       if (w.setFails) throw new Error('quota exceeded');
+      // setTooLarge: the backend rejects the write because the value is too
+      // big (APS per-row cap surfaces as value_too_large).
+      if (w.setTooLarge) {
+        const err = new Error('row too large');
+        err.code = 'value_too_large';
+        throw err;
+      }
       // Simulate APS optimistic concurrency: if the caller passes an etag that
       // doesn't match the current one, surface precondition_failed instead of
       // clobbering. Tests that don't simulate a concurrent writer leave etag

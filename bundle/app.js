@@ -482,6 +482,10 @@ function renderSaveRow() {
         note.textContent = err.message;
       } else if (err instanceof HostError && err.code === 'storage_conflict') {
         note.textContent = 'Your notebook was being changed elsewhere. Try again.';
+      } else if (err instanceof HostError && err.code === 'notebook_full') {
+        // The backend rejected the write as too big. The message is the
+        // user-facing sentence set in host.js; nothing is marked saved.
+        note.textContent = err.message;
       } else if (state.notebookError) {
         note.textContent = "Your notebook couldn't be loaded, so nothing was saved. Try again.";
       } else {
