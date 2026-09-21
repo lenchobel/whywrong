@@ -84,34 +84,3 @@ anna-app login --host https://anna.partners
 anna-app dev                # opens the app with the REAL AI
 ```
 
-### What I checked
-
-- 43 logic tests and 18 browser tests pass. The browser tests run in real
-  Chromium with the same strict content policy as `manifest.json`
-  (scripts and styles from the bundle only), so inline code would fail.
-- I broke the code on purpose in three places (reply checking, the retry, and
-  "save even if the notebook can't be read"). The tests caught all three.
-- Phone width (360px): no sideways scroll, every control 44px or taller.
-- AI and student text is shown as text. A test feeds it HTML and script tags.
-- If the notebook can't be read, saving is refused so nothing is overwritten.
-
-### What I could NOT check (do these before you submit)
-
-1. **The real Anna SDK.** I couldn't open Anna's SDK pages, so `host.js` assumes
-   `anna.llm.complete(...)` and `anna.storage.get/set(...)`, imported from
-   `/static/anna-apps/_sdk/latest/index.js`. If any of that is different, fix
-   it in `host.js` only. Check against `docs/app-ui-sdk.md`,
-   `docs/host-api-llm.md` and `docs/host-api-storage.md`.
-2. **The real validator.** `manifest.json` is copied from the shape of a real
-   published Anna app, and `app.json` from the beginner guide, but I couldn't
-   run `anna-app validate --strict`. The `category` value in `app.json` is a
-   guess. The Mobile Support page may also want a `form_factors` setting, which
-   I did not add.
-3. **The real AI.** The prompt and the strict checks are only tested with made-up
-   replies. The first real runs may show the AI breaking a rule (for example,
-   trap words that are not word for word in the picked answer). Try 5 to 10 real
-   questions and tune the prompt in `core.js` if needed.
-4. **The review.** There is no separate backend tool (executa). Anna's review
-   asks for working backend logic, and I don't know if the host AI plus storage
-   counts. Ask in the Anna developer forum before you submit.
-5. **Real phones.** I tested a phone-sized window, not a phone.
