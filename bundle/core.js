@@ -5,7 +5,9 @@ export const LIMITS = Object.freeze({
   question: 4000,
   picked: 600,
   right: 600,
-  notebook: 100,
+  // 25 typical entries (~4 KiB each) is ~101 KiB — well under the legacy
+  // bucket's 256 KiB cap. Oversize writes still surface as notebook_full.
+  notebook: 25,
 });
 
 // The fixed list of traps. The AI must choose one of these ids. The wording is

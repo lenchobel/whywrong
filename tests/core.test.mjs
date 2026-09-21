@@ -390,6 +390,55 @@ test('addItem puts the newest first, dedupes by id, and caps the list', () => {
   assert.equal(addItem([item('a')], item('a')).length, 1);
 });
 
+test('a full notebook of typical entries stays safely under the 256 KiB bucket cap', () => {
+  // A realistic entry: a ~600-char question, and 3 drills each with a ~400-char
+  // stem, 4 options and 4 explanations. The legacy bucket caps the whole state
+  // at 256 KiB, so LIMITS.notebook must keep a full notebook of typical
+  // entries well under it (with the old cap of 100 it was ~413 KiB).
+  const clip = (s, n) => (s.length > n ? s.slice(0, n).trimEnd() : s);
+  const question = clip('A passage describes a city that introduced a congestion fee in its historic centre. Council records show traffic counts fell by 18% in the first year, while shop owners reported mixed results: some said fewer cars meant fewer customers, others said deliveries were faster and the streets felt safer. The city also added a free shuttle every ten minutes and repaved two side streets with the fee revenue. Question: what does the passage suggest about the congestion fee, and how does the passage support it?', 600);
+  const picked = clip('The fee eliminated traffic in the historic centre, because the council records show that cars went down by a lot in the very first year after it started.', 600);
+  const right = clip('The fee reduced traffic, though not every owner thought it helped business: some shops lost customers while deliveries got faster and the streets felt safer.', 600);
+  const stem = clip('A town adds a small charge for cars entering the market street on Saturdays. The council says more people now arrive by bus, but some market traders say they sell less because regular customers stopped coming. What does this story suggest about the market street charge?', 400);
+  const drill = () => ({
+    stem,
+    options: [
+      clip('The charge made everyone who shops at the market richer than before.', 300),
+      clip('The charge changed how some people travel and had mixed effects on traders.', 300),
+      clip('The charge had no effect at all on anyone in the town.', 300),
+      clip('The council built a new car park instead of charging for the street.', 300),
+    ],
+    correct: 1,
+    trapOption: 0,
+    explanations: [
+      clip('Wrong: the story says some traders sell less, so not everyone is richer.', 300),
+      clip('Right: travel changed for some people and traders report mixed results.', 300),
+      clip('Wrong: bus use and trader sales both changed, so there was an effect.', 300),
+      clip('Wrong: the story says the town charges cars, not that it built a car park.', 300),
+    ],
+  });
+  const entry = makeItem(
+    { question, picked, right },
+    {
+      trapId: 'half_right',
+      whyTempting: clip('It sounds right because the records do show cars went down, and the picked answer says traffic was eliminated.', 400),
+      trapWords: ['eliminated', 'by a lot'],
+      rule: clip('An answer is only right if every part of it is right. One wrong piece makes the whole choice wrong.', 400),
+      check: clip('Split the answer into its parts. Does the text support each part?', 300),
+      whyRight: clip('The right answer keeps the parts the text supports and does not overstate them.', 400),
+      drills: [drill(), drill(), drill()],
+    },
+    { now: Date.UTC(2026, 8, 19), id: 'mabcdef12345' },
+  );
+  const bytes = Buffer.byteLength(JSON.stringify(entry), 'utf8');
+  assert.equal(bytes, 4132, 'typical entry is ~4 KiB');
+  assert.equal(LIMITS.notebook, 25, 'cap chosen so 25 typical entries (~101 KiB) sit well under 256 KiB');
+  assert.ok(
+    LIMITS.notebook * bytes < 256 * 1024 * 0.75,
+    `a full notebook of typical entries would be ${((LIMITS.notebook * bytes) / 1024).toFixed(0)} KiB — needs >= 25% headroom`,
+  );
+});
+
 test('removeItem and toggleMastered only touch the chosen entry', () => {
   const list = [item('a'), item('b')];
   assert.deepEqual(removeItem(list, 'a').map((x) => x.id), ['b']);
